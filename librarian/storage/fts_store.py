@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from librarian.storage._common import deleted_filter
+
 if TYPE_CHECKING:
     from librarian.storage.database import Database
 
@@ -71,7 +73,6 @@ class FTSStore:
         # Escape special FTS5 characters in the query for simple searches
         # Users can still use FTS5 syntax by quoting terms
         safe_query = self._prepare_query(query)
-        deleted_clause = "" if include_deleted else "AND c.deleted_at IS NULL"
 
         with self.db._connection() as conn:
             rows = conn.execute(
@@ -89,10 +90,10 @@ class FTSStore:
                 JOIN chunks c ON chunks_fts.rowid = c.id
                 JOIN documents d ON c.document_id = d.id
                 WHERE chunks_fts MATCH ?
-                    {deleted_clause}
+                    {deleted_filter(include_deleted)}
                 ORDER BY rank
                 LIMIT ?
-                """,  # noqa: S608 - deleted_clause is a fixed internal literal
+                """,  # noqa: S608 - deleted_filter returns a fixed internal literal
                 (snippet_length, safe_query, limit),
             ).fetchall()
 

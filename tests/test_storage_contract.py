@@ -554,11 +554,29 @@ def test_get_chunk_context_excludes_deleted_unless_opted_in(backend: StorageHarn
     anchor = prepared.chunks[2].chunk_id
     # Default: deleted neighbors filtered out even though the anchor still resolves.
     assert backend.storage.metadata.get_chunk_context(anchor, before=2, after=2) == []
-    # Opt-in: the tombstoned neighbors come back, still in source order.
+    # Opt-in: the tombstoned neighbors come back, still in source order, each
+    # carrying the deleted_at timestamp so callers can tell them from live rows.
     included = backend.storage.metadata.get_chunk_context(
         anchor, before=2, after=2, include_deleted=True
     )
     assert [n.chunk_index for n in included] == [0, 1, 3, 4]
+    assert all(n.deleted_at for n in included)
+
+
+def test_chunk_exists(backend: StorageHarness) -> None:
+    """chunk_exists resolves live and tombstoned chunks, rejects unknown ids."""
+    embedder = FakeEmbedder()
+    prepared = _prepare("m1", "hello world", embedder)
+    _write(backend, prepared)
+    anchor = prepared.chunks[0].chunk_id
+
+    assert backend.storage.metadata.chunk_exists(anchor) is True
+    assert backend.storage.metadata.chunk_exists("nope") is False
+
+    # A tombstoned chunk still "exists" (the row survives a soft delete).
+    with backend.storage.transaction() as conn:
+        backend.storage.soft_delete_document(conn, prepared.document_id, "gone")
+    assert backend.storage.metadata.chunk_exists(anchor) is True
 
 
 def test_search_include_deleted_opt_in(backend: StorageHarness) -> None:

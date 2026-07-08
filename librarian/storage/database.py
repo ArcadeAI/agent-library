@@ -409,10 +409,10 @@ class Database:
         """Fetch the public chunk fields for a set of internal chunk row ids.
 
         Returns a mapping of ``chunks.id`` -> ``{chunk_id, chunk_index,
-        document_size, source_created_at, chunk_source_uri}`` for every id that
-        exists; ids with no matching row are omitted. Lets the MCP layer enrich
-        search results with these columns given only the internal row ids the
-        retrieval pipeline returns.
+        document_size, source_created_at, chunk_source_uri, deleted_at}`` for
+        every id that exists; ids with no matching row are omitted. Lets the MCP
+        layer enrich search results with these columns given only the internal
+        row ids the retrieval pipeline returns.
         """
         if not chunk_ids:
             return {}
@@ -421,7 +421,7 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT id, chunk_id, chunk_index, document_size,
-                       source_created_at, chunk_source_uri
+                       source_created_at, chunk_source_uri, deleted_at
                 FROM chunks WHERE id IN ({placeholders})
                 """,  # noqa: S608 - placeholders are parameter markers
                 tuple(chunk_ids),
@@ -433,6 +433,7 @@ class Database:
                 "document_size": row["document_size"],
                 "source_created_at": row["source_created_at"],
                 "chunk_source_uri": row["chunk_source_uri"],
+                "deleted_at": row["deleted_at"],
             }
             for row in rows
         }
@@ -446,24 +447,21 @@ class Database:
     ) -> "list[ChunkContext]":
         """Return the ``before`` chunks preceding and ``after`` following ``chunk_id``.
 
-        The anchor is located by its deterministic public ``chunk_id`` (TEXT);
-        legacy rows with a null public id fall back to matching the integer
-        surrogate (``chunks.id``) when ``chunk_id`` is all digits. Neighbors are
-        the chunks in the same document whose ``chunk_index`` falls in
-        ``[anchor - before, anchor + after]`` excluding the anchor itself,
+        The anchor is located by its deterministic public ``chunk_id`` (TEXT).
+        Neighbors are the chunks in the same document whose ``chunk_index`` falls
+        in ``[anchor - before, anchor + after]`` excluding the anchor itself,
         returned in source order. At most ``before + after`` rows come back
         (fewer at document boundaries). Soft-deleted neighbors are excluded
         unless ``include_deleted`` is set; the anchor lookup ignores deletion so
         a tombstoned chunk can still be expanded.
         """
-        from librarian.storage.protocols import ChunkContext
+        from librarian.storage._common import chunk_context_from_row, deleted_filter
 
         anchor = self._find_anchor_chunk(chunk_id)
         if anchor is None:
             return []
         doc_pk, anchor_index = anchor
 
-        deleted_clause = "" if include_deleted else "AND c.deleted_at IS NULL"
         with self._connection() as conn:
             rows = conn.execute(
                 f"""
@@ -483,43 +481,38 @@ class Database:
                 WHERE c.document_id = ?
                     AND c.chunk_index BETWEEN ? AND ?
                     AND c.chunk_index != ?
-                    {deleted_clause}
+                    {deleted_filter(include_deleted)}
                 ORDER BY c.chunk_index ASC
-                """,  # noqa: S608 - deleted_clause is a fixed internal literal
+                """,  # noqa: S608 - deleted_filter returns a fixed internal literal
                 (doc_pk, anchor_index - before, anchor_index + after, anchor_index),
             ).fetchall()
 
-        return [
-            ChunkContext(
-                chunk_id=row["chunk_id"],
-                internal_id=row["internal_id"],
-                document_id=row["document_id"],
-                document_path=row["document_path"],
-                content=row["content"],
-                heading_path=row["heading_path"],
-                chunk_index=row["chunk_index"],
-                asset_type=row["asset_type"] or AssetType.TEXT.value,
-                chunk_source_uri=row["chunk_source_uri"],
-                deleted_at=row["deleted_at"],
-            )
-            for row in rows
-        ]
+        return [chunk_context_from_row(row) for row in rows]
 
     def _find_anchor_chunk(self, chunk_id: str) -> tuple[int, int] | None:
-        """Resolve ``chunk_id`` to its ``(document_id, chunk_index)`` or ``None``."""
+        """Resolve ``chunk_id`` to its ``(document_id, chunk_index)`` or ``None``.
+
+        Matches only the deterministic public ``chunk_id`` (TEXT). v0.14 write
+        paths always populate it, so there is no integer-surrogate fallback --
+        that would codify the unstable ``chunks.id`` as a public id form and, on
+        oversized/non-decimal input, raise instead of resolving to "not found".
+        """
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT document_id, chunk_index FROM chunks WHERE chunk_id = ?",
                 (chunk_id,),
             ).fetchone()
-            if row is None and chunk_id.isdigit():
-                row = conn.execute(
-                    "SELECT document_id, chunk_index FROM chunks WHERE id = ?",
-                    (int(chunk_id),),
-                ).fetchone()
         if row is None:
             return None
         return row["document_id"], row["chunk_index"]
+
+    def chunk_exists(self, chunk_id: str) -> bool:
+        """True if a chunk with this public ``chunk_id`` exists (deleted or not)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chunks WHERE chunk_id = ? LIMIT 1", (chunk_id,)
+            ).fetchone()
+        return row is not None
 
     def delete_document(self, doc_id: int) -> None:
         """

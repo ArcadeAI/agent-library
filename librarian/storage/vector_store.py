@@ -16,6 +16,7 @@ from librarian.config import (
     ENABLE_VISION_EMBEDDINGS,
     VISION_EMBEDDING_DIMENSION,
 )
+from librarian.storage._common import deleted_filter
 from librarian.storage.database import get_effective_embedding_dimension, serialize_embedding
 from librarian.types import EmbeddingModality
 
@@ -142,7 +143,6 @@ class VectorStore:
             raise ValueError(msg)
 
         query_blob = serialize_embedding(query_embedding)
-        deleted_clause = "" if include_deleted else "AND c.deleted_at IS NULL"
 
         with self.db._connection() as conn:
             # sqlite-vec uses distance (lower is more similar)
@@ -162,9 +162,9 @@ class VectorStore:
                 JOIN documents d ON c.document_id = d.id
                 WHERE ce.embedding MATCH ?
                     AND k = ?
-                    {deleted_clause}
+                    {deleted_filter(include_deleted)}
                 ORDER BY ce.distance ASC
-                """,  # noqa: S608 - deleted_clause is a fixed internal literal
+                """,  # noqa: S608 - deleted_filter returns a fixed internal literal
                 (query_blob, limit * 2),  # Get extra for filtering
             ).fetchall()
 
@@ -251,7 +251,6 @@ class VectorStore:
 
         table = self._get_table_for_modality(modality)
         query_blob = serialize_embedding(query_embedding)
-        deleted_clause = "" if include_deleted else "AND c.deleted_at IS NULL"
 
         with self.db._connection() as conn:
             rows = conn.execute(
@@ -269,7 +268,7 @@ class VectorStore:
                 JOIN documents d ON c.document_id = d.id
                 WHERE ve.embedding MATCH ?
                     AND k = ?
-                    {deleted_clause}
+                    {deleted_filter(include_deleted)}
                 ORDER BY ve.distance ASC
                 """,  # noqa: S608
                 (query_blob, limit * 2),

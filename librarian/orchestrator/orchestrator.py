@@ -169,16 +169,17 @@ class Orchestrator:
         """
         file_path = Path(file_path).resolve()
         try:
-            mtime = file_path.stat().st_mtime
+            stat_result = file_path.stat()
         except TimeoutError as e:
             raise FileReadTimeoutError(
                 f"Timed out accessing {file_path} (file may not be synced from cloud storage)"
             ) from e
         except OSError as e:
             raise FileReadError(f"Cannot access {file_path}: {e}") from e
+        mtime = stat_result.st_mtime
 
         connector = LocalFileConnector([file_path])
-        event = connector.build_upsert(file_path, mtime)
+        event = connector.build_upsert(file_path, stat_result)
         if event is None:
             return {
                 "path": str(file_path),

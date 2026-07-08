@@ -17,6 +17,7 @@ from librarian.config import (
     ENABLE_VISION_EMBEDDINGS,
     VISION_EMBEDDING_DIMENSION,
 )
+from librarian.storage._common import deleted_filter
 from librarian.storage.database import get_effective_embedding_dimension
 from librarian.storage.postgres.database import PostgresDatabase, parse_vector, vector_literal
 from librarian.storage.vector_store import VectorSearchResult
@@ -106,7 +107,6 @@ class PgVectorStore:
         include_deleted: bool = False,
     ) -> list[VectorSearchResult]:
         literal = vector_literal(query_embedding)
-        deleted_clause = "" if include_deleted else "AND c.deleted_at IS NULL"
         with self.db._connection() as conn:
             rows = conn.execute(
                 f"""
@@ -121,10 +121,10 @@ class PgVectorStore:
                 FROM {table} ve
                 JOIN chunks c ON ve.chunk_id = c.id
                 JOIN documents d ON c.document_id = d.id
-                WHERE TRUE {deleted_clause}
+                WHERE TRUE {deleted_filter(include_deleted)}
                 ORDER BY ve.embedding <=> %s::vector
                 LIMIT %s
-                """,  # noqa: S608 - table/deleted_clause are fixed internal literals
+                """,  # noqa: S608 - table/deleted_filter are fixed internal literals
                 (literal, literal, limit * 2),
             ).fetchall()
 

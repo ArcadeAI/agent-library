@@ -12,6 +12,7 @@ query, giving forgiving plain-language matching without FTS5-specific escaping.
 import logging
 
 from librarian.config import POSTGRES_FTS_LANGUAGE
+from librarian.storage._common import deleted_filter
 from librarian.storage.fts_store import FTSSearchResult
 from librarian.storage.postgres.database import PostgresDatabase
 
@@ -40,7 +41,6 @@ class PgFTSStore:
         headline_opts = (
             f"StartSel=<mark>, StopSel=</mark>, MaxFragments=1, MaxWords={max_words}, MinWords=1"
         )
-        deleted_clause = "" if include_deleted else "AND c.deleted_at IS NULL"
         # The regconfig is passed as a bound parameter (cast to ::regconfig), so it
         # can't be a SQL-injection vector even though it's configurable. It must
         # match the language baked into the generated ``content_tsv`` column at
@@ -63,10 +63,10 @@ class PgFTSStore:
                 JOIN documents d ON c.document_id = d.id
                 CROSS JOIN q
                 WHERE c.content_tsv @@ q.query
-                  {deleted_clause}
+                  {deleted_filter(include_deleted)}
                 ORDER BY rank DESC
                 LIMIT %s
-                """,  # noqa: S608 - headline_opts/deleted_clause are fixed internal literals
+                """,  # noqa: S608 - headline_opts/deleted_filter are fixed internal literals
                 (lang, query, lang, limit),
             ).fetchall()
 

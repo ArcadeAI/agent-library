@@ -422,6 +422,80 @@ class TestExpandContext:
         with pytest.raises(RetryableToolError):
             await expand_context(context=CTX, chunk_id="no-such-chunk")
 
+    @pytest.mark.asyncio
+    async def test_expand_context_unmigrated_db_degrades_gracefully(self, clean_db: Path) -> None:
+        """A serve-only process on a never-migrated DB gets a retryable error, not a crash.
+
+        Without ingest running in-process the read path never adds
+        ``chunks.chunk_id``; the tool must degrade like search_library rather
+        than surfacing a non-retryable backend error.
+        """
+        from librarian.server import expand_context
+
+        with pytest.raises(RetryableToolError):
+            await expand_context(context=CTX, chunk_id="anything")
+
+    @pytest.mark.asyncio
+    async def test_expand_context_single_chunk_returns_empty(
+        self, tmp_path: Path, clean_db: Path
+    ) -> None:
+        """A single-chunk document has no neighbors -> [] (not an error)."""
+        from librarian.server import expand_context, index_directory_to_library
+        from librarian.storage.factory import get_metadata_store
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "solo.md").write_text("# Solo\n\nOne short paragraph.")
+        await index_directory_to_library(context=CTX, directory=str(docs))
+
+        db = get_metadata_store()
+        with db._connection() as conn:  # type: ignore[attr-defined]
+            rows = conn.execute("SELECT chunk_id FROM chunks").fetchall()
+        assert len(rows) == 1
+        assert await expand_context(context=CTX, chunk_id=rows[0]["chunk_id"]) == []
+
+    @pytest.mark.asyncio
+    async def test_expand_context_tombstoned_suggests_include_deleted(
+        self, tmp_path: Path, clean_db: Path
+    ) -> None:
+        """Tombstoned neighbors under the default flag steer the agent to include_deleted."""
+        from librarian.server import expand_context, index_directory_to_library
+        from librarian.storage.factory import get_metadata_store, get_storage
+
+        docs = self._multi_section_doc(tmp_path)
+        await index_directory_to_library(context=CTX, directory=str(docs))
+
+        db = get_metadata_store()
+        with db._connection() as conn:  # type: ignore[attr-defined]
+            ordered = [
+                row["chunk_id"]
+                for row in conn.execute(
+                    "SELECT chunk_id FROM chunks ORDER BY chunk_index"
+                ).fetchall()
+            ]
+        anchor = ordered[len(ordered) // 2]
+
+        # Tombstone the whole document (soft-delete tombstones every chunk).
+        storage = get_storage()
+        with storage.transaction() as conn:
+            for did in [
+                row["document_id"]
+                for row in conn.execute("SELECT document_id FROM documents").fetchall()
+            ]:
+                storage.soft_delete_document(conn, did, "test tombstone")
+
+        # Default flag: the neighbors exist but are tombstoned -> guided to the flag.
+        with pytest.raises(RetryableToolError) as exc:
+            await expand_context(context=CTX, chunk_id=anchor, before=2, after=2)
+        assert "include_deleted" in str(exc.value.additional_prompt_content)
+
+        # Opt-in: neighbors come back, each flagged with its deleted_at tombstone.
+        neighbors = await expand_context(
+            context=CTX, chunk_id=anchor, before=2, after=2, include_deleted=True
+        )
+        assert neighbors
+        assert all(n["deleted_at"] for n in neighbors)
+
     def test_expand_context_is_reexportable(self) -> None:
         """Consumers re-export the tool by importing it from the server module."""
         from librarian.server import expand_context

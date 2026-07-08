@@ -19,6 +19,7 @@ the skip-dirs / unsupported-extension / hidden-file baseline.
 """
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,15 +88,16 @@ class LocalFileConnector(Connector):
             key = str(path)
             seen.add(key)
             try:
-                mtime = path.stat().st_mtime
+                stat_result = path.stat()
             except OSError as e:
                 logger.warning("Skipping %s: %s", path, e)
                 continue
+            mtime = stat_result.st_mtime
 
             if known.get(key) == mtime:
                 continue  # unchanged since last sync
 
-            event = self.build_upsert(path, mtime)
+            event = self.build_upsert(path, stat_result)
             if event is None:
                 continue
             known[key] = mtime
@@ -157,11 +159,18 @@ class LocalFileConnector(Connector):
             track_matcher=track_matcher,
         )
 
-    def build_upsert(self, path: Path, mtime: float) -> DocumentUpsert | None:
+    def build_upsert(self, path: Path, stat_result: os.stat_result) -> DocumentUpsert | None:
         """Build a :class:`DocumentUpsert` for a single file (or ``None`` to skip).
 
         Exposed so the orchestrator's single-file shim can reuse the exact same
         parser-registry routing and inline-text decisions as the streaming path.
+
+        Takes the caller's already-computed :class:`os.stat_result` rather than
+        re-``stat``-ing: both callers stat the file immediately before calling
+        this, so passing it through keeps it to one syscall per file and — more
+        importantly — keeps the recorded ``file_mtime`` and ``source_created_at``
+        derived from the *same* stat, so they can't disagree if a concurrent
+        write races between two stats.
 
         The path is canonicalized so the deterministic id derived from
         ``source_native_id`` is identical regardless of whether the caller passed
@@ -187,21 +196,17 @@ class LocalFileConnector(Connector):
             document_source_uri=path.as_uri(),
             raw_content=raw_content,
             mimetype=path.suffix.lstrip("."),
-            metadata={"file_mtime": mtime},
-            source_created_at=self._source_created_at(path, mtime),
+            metadata={"file_mtime": stat_result.st_mtime},
+            source_created_at=self._source_created_at(stat_result),
         )
 
     @staticmethod
-    def _source_created_at(path: Path, mtime: float) -> datetime:
-        """Best-effort file creation timestamp (UTC).
+    def _source_created_at(stat_result: os.stat_result) -> datetime:
+        """Best-effort file creation timestamp (UTC) from an existing stat.
 
         Uses the filesystem birth time where the platform exposes it
         (``st_birthtime`` on macOS/BSD), otherwise falls back to the modification
         time so the column is always populated for file-sourced documents.
         """
-        try:
-            stat = path.stat()
-        except OSError:
-            return datetime.fromtimestamp(mtime, tz=timezone.utc)
-        created_ts = getattr(stat, "st_birthtime", None) or stat.st_mtime
+        created_ts = getattr(stat_result, "st_birthtime", None) or stat_result.st_mtime
         return datetime.fromtimestamp(created_ts, tz=timezone.utc)
