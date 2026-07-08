@@ -80,6 +80,7 @@ class HybridSearcher:
         use_mmr: bool = True,
         filter_document_ids: list[int] | None = None,
         asset_types: list[AssetType] | None = None,
+        include_deleted: bool = False,
     ) -> list[SearchResult]:
         """
         Perform hybrid search across all enabled modalities.
@@ -94,6 +95,8 @@ class HybridSearcher:
             use_mmr: Whether to use MMR for diverse results.
             filter_document_ids: Optional list of document IDs to search within.
             asset_types: Optional list of asset types to filter results by.
+            include_deleted: When True, soft-deleted chunks are included; by
+                default the retrieval layer filters them out.
 
         Returns:
             List of search results ordered by relevance.
@@ -108,11 +111,12 @@ class HybridSearcher:
                 use_mmr=use_mmr,
                 filter_document_ids=filter_document_ids,
                 asset_types=asset_types,
+                include_deleted=include_deleted,
             )
 
         # Fall back to original text-only hybrid search
-        vector_results = self._vector_search(query, limit * 2)
-        fts_results = self._fts_search(query, limit * 2)
+        vector_results = self._vector_search(query, limit * 2, include_deleted=include_deleted)
+        fts_results = self._fts_search(query, limit * 2, include_deleted=include_deleted)
 
         # Combine and score results
         combined = self._combine_results(vector_results, fts_results)
@@ -137,6 +141,7 @@ class HybridSearcher:
         self,
         query: str,
         limit: int | None = None,
+        include_deleted: bool = False,
     ) -> list[SearchResult]:
         """
         Perform pure vector similarity search.
@@ -144,17 +149,19 @@ class HybridSearcher:
         Args:
             query: The search query.
             limit: Maximum number of results.
+            include_deleted: When True, soft-deleted chunks are included.
 
         Returns:
             List of search results.
         """
         limit = limit or SEARCH_LIMIT
-        return self._vector_search(query, limit)
+        return self._vector_search(query, limit, include_deleted=include_deleted)
 
     def keyword_search(
         self,
         query: str,
         limit: int | None = None,
+        include_deleted: bool = False,
     ) -> list[SearchResult]:
         """
         Perform pure keyword/FTS search.
@@ -162,12 +169,13 @@ class HybridSearcher:
         Args:
             query: The search query.
             limit: Maximum number of results.
+            include_deleted: When True, soft-deleted chunks are included.
 
         Returns:
             List of search results.
         """
         limit = limit or SEARCH_LIMIT
-        return self._fts_search(query, limit)
+        return self._fts_search(query, limit, include_deleted=include_deleted)
 
     def multi_modal_search(
         self,
@@ -176,6 +184,7 @@ class HybridSearcher:
         use_mmr: bool = True,
         filter_document_ids: list[int] | None = None,
         asset_types: list[AssetType] | None = None,
+        include_deleted: bool = False,
     ) -> list[SearchResult]:
         """
         Perform search across all enabled modalities with fair weighting.
@@ -203,26 +212,28 @@ class HybridSearcher:
         modality_results: dict[str, list[SearchResult]] = {}
 
         # 1. TEXT modality (always enabled)
-        text_results = self._vector_search(query, limit * 2)
+        text_results = self._vector_search(query, limit * 2, include_deleted=include_deleted)
         if text_results:
             modality_results["text"] = text_results
 
         # 2. CODE modality (if enabled)
         if ENABLE_CODE_EMBEDDINGS:
-            code_results = self.vector_search_by_modality(query, EmbeddingModality.CODE, limit * 2)
+            code_results = self.vector_search_by_modality(
+                query, EmbeddingModality.CODE, limit * 2, include_deleted=include_deleted
+            )
             if code_results:
                 modality_results["code"] = code_results
 
         # 3. VISION modality (if enabled)
         if ENABLE_VISION_EMBEDDINGS:
             vision_results = self.vector_search_by_modality(
-                query, EmbeddingModality.VISION, limit * 2
+                query, EmbeddingModality.VISION, limit * 2, include_deleted=include_deleted
             )
             if vision_results:
                 modality_results["vision"] = vision_results
 
         # 4. FTS (keyword search)
-        fts_results = self._fts_search(query, limit * 2)
+        fts_results = self._fts_search(query, limit * 2, include_deleted=include_deleted)
         if fts_results:
             modality_results["fts"] = fts_results
 
@@ -347,6 +358,7 @@ class HybridSearcher:
         query: str,
         modality: EmbeddingModality,
         limit: int | None = None,
+        include_deleted: bool = False,
     ) -> list[SearchResult]:
         """
         Perform vector search using modality-specific embeddings.
@@ -379,7 +391,9 @@ class HybridSearcher:
             return []
 
         # Search the modality-specific vector table
-        results = self.vector_store.search_by_modality(query_embedding, modality, limit=limit)
+        results = self.vector_store.search_by_modality(
+            query_embedding, modality, limit=limit, include_deleted=include_deleted
+        )
 
         return [
             SearchResult(
@@ -395,10 +409,14 @@ class HybridSearcher:
             for r in results
         ]
 
-    def _vector_search(self, query: str, limit: int) -> list[SearchResult]:
+    def _vector_search(
+        self, query: str, limit: int, include_deleted: bool = False
+    ) -> list[SearchResult]:
         """Perform vector similarity search."""
         query_embedding = self.embedder.embed_query(query)
-        results = self.vector_store.search(query_embedding, limit=limit)
+        results = self.vector_store.search(
+            query_embedding, limit=limit, include_deleted=include_deleted
+        )
 
         return [
             SearchResult(
@@ -414,9 +432,11 @@ class HybridSearcher:
             for r in results
         ]
 
-    def _fts_search(self, query: str, limit: int) -> list[SearchResult]:
+    def _fts_search(
+        self, query: str, limit: int, include_deleted: bool = False
+    ) -> list[SearchResult]:
         """Perform full-text search."""
-        results = self.fts_store.search(query, limit=limit)
+        results = self.fts_store.search(query, limit=limit, include_deleted=include_deleted)
 
         # Normalize FTS scores (BM25 scores are negative, more negative = better)
         if not results:

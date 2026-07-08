@@ -104,6 +104,30 @@ class SearchHit(TypedDict):
     chunk_index: int | None
     document_size: int | None
     source_created_at: str | None
+    # ISO-8601 tombstone timestamp when the chunk is soft-deleted, else None.
+    # Only non-null hits appear when a search is run with include_deleted=True,
+    # so an agent can tell "removed from source, kept for history" from current.
+    deleted_at: str | None
+
+
+class ContextChunk(TypedDict):
+    """One neighbor chunk returned by ``expand_context``.
+
+    Same identity/shape as a search hit's chunk, minus the relevance score:
+    these are positional neighbors, not ranked matches.
+    """
+
+    chunk_id: str  # deterministic hash (v0.14); falls back to the surrogate id as str
+    document_id: int
+    document_path: str
+    content: str
+    heading_path: str | None
+    chunk_index: int
+    asset_type: str
+    chunk_source_uri: str | None
+    # ISO-8601 tombstone timestamp when soft-deleted (only populated for
+    # neighbors returned under include_deleted=True), else None.
+    deleted_at: str | None
 
 
 class _ReadOutputRequired(TypedDict):

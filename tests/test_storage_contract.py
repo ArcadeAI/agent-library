@@ -141,6 +141,42 @@ def _prepare(native_id: str, text: str, embedder: FakeEmbedder) -> PreparedDocum
     )
 
 
+def _prepare_multi(native_id: str, texts: list[str], embedder: FakeEmbedder) -> PreparedDocument:
+    """Build a multi-chunk PreparedDocument with deterministic ids + source URIs.
+
+    Used by the ``expand_context`` window tests, which need several ordered
+    chunks in one document.
+    """
+    content = "\n\n".join(texts)
+    doc_uri = f"file:///{native_id}"
+    chunks = [
+        PreparedChunk(
+            chunk_id=ids.chunk_id(CONNECTOR, SOURCE_TYPE, f"{native_id}#{i}"),
+            content=text,
+            chunk_index=i,
+            start_char=0,
+            end_char=len(text),
+            chunk_source_uri=f"{doc_uri}#chunk={i}",
+            asset_type=AssetType.TEXT,
+            modality=EmbeddingModality.TEXT,
+            embedding=embedder.embed_documents([text])[0],
+            model_version=embedder.model_name,
+        )
+        for i, text in enumerate(texts)
+    ]
+    return PreparedDocument(
+        document_id=ids.document_id(CONNECTOR, SOURCE_TYPE, native_id),
+        path=native_id,
+        title=native_id,
+        content=content,
+        metadata={"source": "contract"},
+        asset_type=AssetType.TEXT,
+        document_source_uri=doc_uri,
+        document_size=len(content),
+        chunks=chunks,
+    )
+
+
 def _write(harness: StorageHarness, prepared: PreparedDocument) -> None:
     with harness.storage.transaction() as conn:
         harness.storage.write_upsert(conn, prepared)
@@ -420,6 +456,149 @@ def test_read_protocol_parity(backend: StorageHarness) -> None:
     assert stored is not None
     assert len(stored) == EMBED_DIM
     assert meta.get_chunk_public_fields([m1_chunk_internal_id])  # sanity: id exists
+
+
+# =============================================================================
+# Slice 3: schema confirmation, model_version, expand_context, soft-delete opt-in
+# =============================================================================
+
+# Every v0.14 column the schema must carry, by table. Selecting them with
+# ``LIMIT 0`` is a backend-neutral existence probe: it raises on a missing
+# column on either substrate but reads no rows.
+_V014_COLUMNS: dict[str, list[str]] = {
+    "documents": ["document_id", "document_source_uri", "source_created_at"],
+    "chunks": [
+        "chunk_id",
+        "chunk_index",
+        "document_size",
+        "source_created_at",
+        "deleted_at",
+        "deletion_reason",
+        "document_source_uri",
+        "chunk_source_uri",
+    ],
+    "chunk_embeddings": ["model_version"],
+}
+
+
+def test_v014_schema_columns_present(backend: StorageHarness) -> None:
+    """All v0.14 columns exist on both substrates (acceptance criterion #1)."""
+    with backend.storage.database._connection() as conn:
+        for table, columns in _V014_COLUMNS.items():
+            select_list = ", ".join(columns)
+            # Raises on either substrate if any column is missing; reads no rows.
+            conn.execute(f"SELECT {select_list} FROM {table} LIMIT 0")  # noqa: S608
+
+
+def test_model_version_recorded_on_every_embedding(backend: StorageHarness) -> None:
+    """Every ``chunk_embeddings`` row carries a non-null model_version."""
+    embedder = FakeEmbedder()
+    _write(backend, _prepare("m1", "hello world", embedder))
+    _write(backend, _prepare_multi("m2", ["alpha", "beta", "gamma"], embedder))
+
+    total = backend.count("chunk_embeddings")
+    assert total == 4
+    with_version = backend.count("chunk_embeddings", "model_version IS NOT NULL")
+    assert with_version == total
+    with backend.storage.database._connection() as conn:
+        rows = conn.execute("SELECT DISTINCT model_version FROM chunk_embeddings").fetchall()
+    assert {row["model_version"] for row in rows} == {embedder.model_name}
+
+
+def test_get_chunk_context_returns_neighbors_in_source_order(backend: StorageHarness) -> None:
+    """expand_context window: before=2/after=2 around a middle chunk -> 4 in order."""
+    embedder = FakeEmbedder()
+    prepared = _prepare_multi("doc", ["c0", "c1", "c2", "c3", "c4"], embedder)
+    _write(backend, prepared)
+
+    anchor = prepared.chunks[2].chunk_id  # chunk_index == 2
+    neighbors = backend.storage.metadata.get_chunk_context(anchor, before=2, after=2)
+
+    assert [n.chunk_index for n in neighbors] == [0, 1, 3, 4]  # anchor (2) excluded
+    assert [n.content for n in neighbors] == ["c0", "c1", "c3", "c4"]
+    # Source URIs and ids are preserved on the returned neighbors.
+    assert neighbors[0].chunk_id == prepared.chunks[0].chunk_id
+    assert neighbors[-1].chunk_source_uri == prepared.chunks[4].chunk_source_uri
+
+
+def test_get_chunk_context_clips_at_document_boundary(backend: StorageHarness) -> None:
+    embedder = FakeEmbedder()
+    prepared = _prepare_multi("doc", ["c0", "c1", "c2"], embedder)
+    _write(backend, prepared)
+
+    # Anchor at the first chunk: no preceding neighbors, two following.
+    head = backend.storage.metadata.get_chunk_context(
+        prepared.chunks[0].chunk_id, before=2, after=2
+    )
+    assert [n.chunk_index for n in head] == [1, 2]
+
+    # A single-chunk document has no neighbors at all.
+    solo = _prepare("solo", "only chunk", embedder)
+    _write(backend, solo)
+    assert backend.storage.metadata.get_chunk_context(solo.chunks[0].chunk_id) == []
+
+
+def test_get_chunk_context_unknown_chunk_returns_empty(backend: StorageHarness) -> None:
+    assert backend.storage.metadata.get_chunk_context("does-not-exist") == []
+
+
+def test_get_chunk_context_excludes_deleted_unless_opted_in(backend: StorageHarness) -> None:
+    embedder = FakeEmbedder()
+    prepared = _prepare_multi("doc", ["c0", "c1", "c2", "c3", "c4"], embedder)
+    _write(backend, prepared)
+
+    # Tombstone the whole document, then expand around a (now-deleted) anchor.
+    with backend.storage.transaction() as conn:
+        backend.storage.soft_delete_document(conn, prepared.document_id, "gone")
+
+    anchor = prepared.chunks[2].chunk_id
+    # Default: deleted neighbors filtered out even though the anchor still resolves.
+    assert backend.storage.metadata.get_chunk_context(anchor, before=2, after=2) == []
+    # Opt-in: the tombstoned neighbors come back, still in source order, each
+    # carrying the deleted_at timestamp so callers can tell them from live rows.
+    included = backend.storage.metadata.get_chunk_context(
+        anchor, before=2, after=2, include_deleted=True
+    )
+    assert [n.chunk_index for n in included] == [0, 1, 3, 4]
+    assert all(n.deleted_at for n in included)
+
+
+def test_chunk_exists(backend: StorageHarness) -> None:
+    """chunk_exists resolves live and tombstoned chunks, rejects unknown ids."""
+    embedder = FakeEmbedder()
+    prepared = _prepare("m1", "hello world", embedder)
+    _write(backend, prepared)
+    anchor = prepared.chunks[0].chunk_id
+
+    assert backend.storage.metadata.chunk_exists(anchor) is True
+    assert backend.storage.metadata.chunk_exists("nope") is False
+
+    # A tombstoned chunk still "exists" (the row survives a soft delete).
+    with backend.storage.transaction() as conn:
+        backend.storage.soft_delete_document(conn, prepared.document_id, "gone")
+    assert backend.storage.metadata.chunk_exists(anchor) is True
+
+
+def test_search_include_deleted_opt_in(backend: StorageHarness) -> None:
+    """Soft-deleted chunks are excluded by default and returned on opt-in.
+
+    Covers both read paths (vector + FTS) on both substrates.
+    """
+    embedder = FakeEmbedder()
+    prepared = _prepare("m1", "the quick brown fox", embedder)
+    _write(backend, prepared)
+    query = embedder.embed_documents(["the quick brown fox"])[0]
+
+    with backend.storage.transaction() as conn:
+        backend.storage.soft_delete_document(conn, prepared.document_id, "gone")
+
+    # Default: hidden from both modalities.
+    assert backend.storage.vectors.search(query, limit=5, min_similarity=-1.0) == []
+    assert backend.storage.fts.search("quick fox", limit=5) == []
+
+    # Opt-in: both modalities surface the tombstoned chunk again.
+    assert backend.storage.vectors.search(query, limit=5, min_similarity=-1.0, include_deleted=True)
+    assert backend.storage.fts.search("quick fox", limit=5, include_deleted=True)
 
 
 def test_postgres_param_not_silently_skipped() -> None:

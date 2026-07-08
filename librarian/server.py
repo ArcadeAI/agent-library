@@ -56,6 +56,7 @@ from librarian.storage.database import get_database
 from librarian.storage.factory import get_metadata_store, get_storage
 from librarian.tool_outputs import (
     AddOutput,
+    ContextChunk,
     DocumentSummary,
     IndexDirectoryOutput,
     LibraryConfig,
@@ -739,6 +740,11 @@ async def search_library(
         "End date for custom range (YYYY-MM-DD). Use with start_date.",
     ] = None,
     limit: Annotated[int, "Maximum number of results to return"] = 10,
+    include_deleted: Annotated[
+        bool,
+        "Include soft-deleted (tombstoned) chunks in results. Off by default; "
+        "turn on to surface content removed from its source but kept for history.",
+    ] = False,
 ) -> Annotated[
     list[SearchHit],
     "Ranked list of matching chunks with score, snippet, and asset type.",
@@ -772,6 +778,8 @@ async def search_library(
         mode = SearchMode.HYBRID
     if limit is None:
         limit = 10
+    if include_deleted is None:
+        include_deleted = False
 
     db = get_metadata_store()
     filter_doc_ids: list[int] | None = None
@@ -835,19 +843,21 @@ async def search_library(
             # Use modality-specific embeddings when available
             if asset_type == AssetType.CODE and ENABLE_CODE_EMBEDDINGS:
                 results = searcher.vector_search_by_modality(
-                    query, EmbeddingModality.CODE, limit=limit
+                    query, EmbeddingModality.CODE, limit=limit, include_deleted=include_deleted
                 )
             elif asset_type == AssetType.IMAGE and ENABLE_VISION_EMBEDDINGS:
                 results = searcher.vector_search_by_modality(
-                    query, EmbeddingModality.VISION, limit=limit
+                    query, EmbeddingModality.VISION, limit=limit, include_deleted=include_deleted
                 )
             else:
-                results = searcher.vector_search(query, limit=limit)
+                results = searcher.vector_search(
+                    query, limit=limit, include_deleted=include_deleted
+                )
                 # Filter by asset type if specified (vector_search doesn't support it natively)
                 if asset_type_filter:
                     results = [r for r in results if r.asset_type in asset_type_filter][:limit]
         elif mode == SearchMode.KEYWORD:
-            results = searcher.keyword_search(query, limit=limit)
+            results = searcher.keyword_search(query, limit=limit, include_deleted=include_deleted)
             # Filter by asset type if specified
             if asset_type_filter:
                 results = [r for r in results if r.asset_type in asset_type_filter][:limit]
@@ -859,6 +869,7 @@ async def search_library(
                 use_mmr=True,
                 filter_document_ids=filter_doc_ids,
                 asset_types=asset_type_filter,
+                include_deleted=include_deleted,
             )
     except Exception as e:
         logger.exception("search_library failed (mode=%s)", mode.value)
@@ -901,9 +912,148 @@ async def search_library(
                 chunk_index=extra.get("chunk_index"),
                 document_size=extra.get("document_size"),
                 source_created_at=extra.get("source_created_at"),
+                deleted_at=extra.get("deleted_at"),
             )
         )
     return hits
+
+
+# Upper bound on each side of an expand_context window. Guards against a caller
+# asking for the whole document (thousands of chunks, full content each) in one
+# MCP response; mirrors the negative-value clamp on the same params.
+_EXPAND_CONTEXT_MAX = 50
+
+
+def _clamp_window(value: int | None, default: int = 2) -> int:
+    """Coerce a window size to ``[0, _EXPAND_CONTEXT_MAX]`` (None/negative -> default)."""
+    if value is None or value < 0:
+        return default
+    return min(value, _EXPAND_CONTEXT_MAX)
+
+
+@app.tool(  # type: ignore[arg-type]
+    metadata=ToolMetadata(
+        behavior=Behavior(
+            operations=[Operation.READ],
+            read_only=True,
+            destructive=False,
+            idempotent=True,
+            open_world=False,
+        ),
+    ),
+)
+async def expand_context(
+    context: Context,
+    chunk_id: Annotated[
+        str,
+        "The chunk_id to expand around (the value returned by search_library).",
+    ],
+    before: Annotated[int, "Number of chunks to retrieve before the given chunk"] = 2,
+    after: Annotated[int, "Number of chunks to retrieve after the given chunk"] = 2,
+    include_deleted: Annotated[
+        bool,
+        "Include soft-deleted neighbor chunks. Off by default.",
+    ] = False,
+) -> Annotated[
+    list[ContextChunk],
+    "Neighboring chunks from the same document, in source order.",
+]:
+    """
+    Retrieve the chunks surrounding a search hit, in source order.
+
+    Search returns isolated chunks, so a fragmentary match (e.g. a reply that
+    just says "yes, do it") can be hard to interpret on its own. Call this with
+    that chunk's `chunk_id` to pull its neighbors from the same document and
+    reconstruct the surrounding context.
+
+    Returns up to `before + after` chunks (fewer near document boundaries, and
+    at most 50 per side), ordered by their position in the document. The anchor
+    chunk itself is not repeated — you already have it from search.
+    """
+    before = _clamp_window(before)
+    after = _clamp_window(after)
+    if include_deleted is None:
+        include_deleted = False
+
+    anchor_id = str(chunk_id).strip() if chunk_id else ""
+    if not anchor_id:
+        raise RetryableToolError(
+            message="expand_context needs a chunk_id.",
+            additional_prompt_content=(
+                "Pass the `chunk_id` from a search_library result. Run "
+                "search_library first, then call expand_context with the "
+                "chunk_id of the hit you want more context around."
+            ),
+        )
+
+    db = get_metadata_store()
+    try:
+        neighbors = db.get_chunk_context(
+            anchor_id, before=before, after=after, include_deleted=include_deleted
+        )
+    except Exception as e:
+        # Backend unreachable, or a serve-only process pointed at a database the
+        # v0.14 write path never migrated (no chunks.chunk_id column yet).
+        # Degrade like search_library instead of dead-ending on a non-retryable
+        # error the agent can't act on.
+        logger.exception("expand_context failed (chunk_id=%s)", chunk_id)
+        raise RetryableToolError(
+            message="Couldn't expand context right now.",
+            additional_prompt_content=(
+                "The library index may be empty or not built yet. Add content "
+                "with index_directory_to_library first, then retry. To confirm "
+                "the index exists, call get_library_overview(view='stats')."
+            ),
+        ) from e
+
+    if neighbors:
+        return [
+            ContextChunk(
+                chunk_id=n.chunk_id or str(n.internal_id),
+                document_id=n.document_id,
+                document_path=n.document_path,
+                content=n.content,
+                heading_path=n.heading_path,
+                chunk_index=n.chunk_index,
+                asset_type=n.asset_type,
+                chunk_source_uri=n.chunk_source_uri,
+                deleted_at=n.deleted_at,
+            )
+            for n in neighbors
+        ]
+
+    # Empty window: three distinct causes, each needs different guidance. The
+    # anchor lookup ignores deletion, so an existing-but-tombstoned anchor gets
+    # here with default include_deleted=False.
+    if not include_deleted:
+        # A soft delete tombstones every chunk of a document at once, so an agent
+        # that found this anchor via include_deleted=True and dropped the flag
+        # lands exactly here — steer it to the one thing that would work.
+        tombstoned = db.get_chunk_context(
+            anchor_id, before=before, after=after, include_deleted=True
+        )
+        if tombstoned:
+            raise RetryableToolError(
+                message=f"The neighbors of chunk_id={chunk_id!r} are soft-deleted.",
+                additional_prompt_content=(
+                    "Call expand_context again with include_deleted=True to include "
+                    "tombstoned chunks (content removed from its source but kept "
+                    "for history)."
+                ),
+            )
+
+    if not db.chunk_exists(anchor_id):
+        raise RetryableToolError(
+            message=f"No chunk found for chunk_id={chunk_id!r}.",
+            additional_prompt_content=(
+                "Double-check the chunk_id came from a recent search_library "
+                "result — expand_context takes the `chunk_id` field of a hit."
+            ),
+        )
+
+    # The anchor exists but stands alone (single-chunk document): an empty list
+    # is the honest answer, matching search_library's empty-result convention.
+    return []
 
 
 # =============================================================================

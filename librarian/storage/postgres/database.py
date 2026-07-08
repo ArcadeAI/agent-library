@@ -30,7 +30,7 @@ import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from librarian.config import (
     POSTGRES_CONNECT_TIMEOUT,
@@ -40,6 +40,9 @@ from librarian.config import (
     POSTGRES_STATEMENT_TIMEOUT_MS,
 )
 from librarian.types import AssetType, Document
+
+if TYPE_CHECKING:
+    from librarian.storage.protocols import ChunkContext
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +258,7 @@ class PostgresDatabase:
             rows = conn.execute(
                 """
                 SELECT id, chunk_id, chunk_index, document_size,
-                       source_created_at, chunk_source_uri
+                       source_created_at, chunk_source_uri, deleted_at
                 FROM chunks WHERE id = ANY(%s)
                 """,
                 (list(chunk_ids),),
@@ -267,9 +270,84 @@ class PostgresDatabase:
                 "document_size": row["document_size"],
                 "source_created_at": row["source_created_at"],
                 "chunk_source_uri": row["chunk_source_uri"],
+                "deleted_at": row["deleted_at"],
             }
             for row in rows
         }
+
+    def get_chunk_context(
+        self,
+        chunk_id: str,
+        before: int = 2,
+        after: int = 2,
+        include_deleted: bool = False,
+    ) -> "list[ChunkContext]":
+        """Postgres parity for :meth:`Database.get_chunk_context`.
+
+        Same window semantics as the SQLite backend: locate the anchor by public
+        ``chunk_id`` (TEXT), then return the chunks in
+        ``[anchor - before, anchor + after]`` excluding the anchor, in source
+        order. Soft-deleted neighbors are included only when ``include_deleted``
+        is set.
+        """
+        from librarian.storage._common import chunk_context_from_row, deleted_filter
+
+        anchor = self._find_anchor_chunk(chunk_id)
+        if anchor is None:
+            return []
+        doc_pk, anchor_index = anchor
+
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.id AS internal_id,
+                    c.chunk_id AS chunk_id,
+                    c.document_id AS document_id,
+                    c.content AS content,
+                    c.heading_path AS heading_path,
+                    c.chunk_index AS chunk_index,
+                    c.asset_type AS asset_type,
+                    c.chunk_source_uri AS chunk_source_uri,
+                    c.deleted_at AS deleted_at,
+                    d.path AS document_path
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.document_id = %s
+                    AND c.chunk_index BETWEEN %s AND %s
+                    AND c.chunk_index != %s
+                    {deleted_filter(include_deleted)}
+                ORDER BY c.chunk_index ASC
+                """,  # noqa: S608 - deleted_filter returns a fixed internal literal
+                (doc_pk, anchor_index - before, anchor_index + after, anchor_index),
+            ).fetchall()
+
+        return [chunk_context_from_row(row) for row in rows]
+
+    def _find_anchor_chunk(self, chunk_id: str) -> tuple[int, int] | None:
+        """Resolve ``chunk_id`` to its ``(document_id, chunk_index)`` or ``None``.
+
+        Matches only the deterministic public ``chunk_id`` (TEXT). Postgres is a
+        v0.14-only substrate, so legacy NULL-``chunk_id`` rows can't exist by
+        construction -- there is no integer-surrogate fallback to diverge from
+        SQLite over.
+        """
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT document_id, chunk_index FROM chunks WHERE chunk_id = %s",
+                (chunk_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["document_id"], row["chunk_index"]
+
+    def chunk_exists(self, chunk_id: str) -> bool:
+        """True if a chunk with this public ``chunk_id`` exists (deleted or not)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chunks WHERE chunk_id = %s LIMIT 1", (chunk_id,)
+            ).fetchone()
+        return row is not None
 
     def get_stats(self) -> dict[str, Any]:
         with self._connection() as conn:
