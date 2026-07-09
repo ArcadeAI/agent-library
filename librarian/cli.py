@@ -946,20 +946,17 @@ def remove_source(
             rprint("[yellow]Cancelled.[/yellow]")
             return
 
-    # Remove documents from index
-    from librarian.storage.database import get_database
+    # Remove documents from index through the storage factory so removal honors
+    # STORAGE_BACKEND (on Postgres this must delete from Postgres, not a stray
+    # SQLite file). delete_document_by_path is the backend-agnostic hard delete.
+    from librarian.storage.factory import get_metadata_store, get_storage
 
-    db = get_database()
     source_path = to_remove["path"]
-
-    # Get all documents from this source
-    documents = db.list_documents()
+    storage = get_storage()
     removed_count = 0
 
-    for doc in documents:
-        if doc.path.startswith(source_path) and doc.id:
-            db.delete_chunks_by_document(doc.id)
-            db.delete_document(doc.id)
+    for doc in get_metadata_store().list_documents():
+        if doc.path.startswith(source_path) and storage.delete_document_by_path(doc.path):
             removed_count += 1
 
     # Remove from sources list
@@ -1019,10 +1016,11 @@ def index_stats(
     # exempt from the top-level guard so the rebuild path stays runnable).
     _guard_schema_or_exit()
 
-    from librarian.storage.database import get_database
+    # Stats is backend-agnostic (get_stats is on the metadata protocol), so it
+    # goes through the storage factory and honors STORAGE_BACKEND.
+    from librarian.storage.factory import get_metadata_store
 
-    db = get_database()
-    stats_data = db.get_stats()
+    stats_data = get_metadata_store().get_stats()
 
     if output_json:
         print(json.dumps(stats_data, indent=2, default=str))

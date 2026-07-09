@@ -135,6 +135,93 @@ class TestIngestionTools:
         assert (temp_docs_dir / "new_doc.md").exists()
 
     @pytest.mark.asyncio
+    async def test_add_to_library_no_embedding_fallback_uses_factory(
+        self, temp_docs_dir: Path, clean_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When indexing fails, the no-embedding fallback stores the document
+        through the storage factory (honoring STORAGE_BACKEND), not a direct
+        SQLite call. The document row is persisted and retrievable even though
+        no chunks/embeddings were written."""
+        import librarian.server as server
+        from librarian.storage.factory import get_metadata_store
+
+        def _boom(_file_path: Path) -> dict:
+            raise RuntimeError("embedding service unavailable")
+
+        monkeypatch.setattr(server, "_process_and_index_file", _boom)
+
+        result = await server.add_to_library(
+            context=CTX,
+            content="# Fallback Doc\n\nStored without embeddings.",
+            title="fallback_doc",
+            directory=str(temp_docs_dir),
+        )
+
+        assert result.get("status") == "stored_partial"
+        assert result.get("indexed") is False
+
+        # The document row landed through the factory and is retrievable.
+        file_path = temp_docs_dir / "fallback_doc.md"
+        doc = get_metadata_store().get_document_by_path(str(file_path))
+        assert doc is not None
+        assert "Stored without embeddings." in doc.content
+
+    @pytest.mark.asyncio
+    async def test_no_embedding_fallback_preserves_existing_index(
+        self, temp_docs_dir: Path, clean_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback must not wipe an already-indexed document's chunks.
+
+        If a file was indexed, then removed from disk out-of-band (its index rows
+        survive) and re-added during an embedding outage, the zero-chunk fallback
+        upsert would otherwise hard-delete the live chunks. The guard skips the
+        write when the path is already indexed, leaving search intact.
+        """
+        import librarian.server as server
+        from librarian.storage.factory import get_metadata_store, get_read_storage
+
+        # 1. Index a document normally (it gets chunks).
+        await server.add_to_library(
+            context=CTX,
+            content="# Kept Doc\n\nThis content stays searchable.",
+            title="kept_doc",
+            directory=str(temp_docs_dir),
+        )
+        file_path = temp_docs_dir / "kept_doc.md"
+        doc = get_metadata_store().get_document_by_path(str(file_path))
+        assert doc is not None
+
+        def _count_chunks() -> int:
+            with get_read_storage().database._connection() as conn:
+                return conn.execute(
+                    "SELECT COUNT(*) AS n FROM chunks WHERE document_id = ? AND deleted_at IS NULL",
+                    (doc.id,),
+                ).fetchone()["n"]
+
+        chunks_before = _count_chunks()
+        assert chunks_before > 0
+
+        # 2. File removed out-of-band (index rows remain), then re-added during
+        #    an embedding outage.
+        file_path.unlink()
+
+        def _boom(_file_path: Path) -> dict:
+            raise RuntimeError("embedding service unavailable")
+
+        monkeypatch.setattr(server, "_process_and_index_file", _boom)
+
+        result = await server.add_to_library(
+            context=CTX,
+            content="# Kept Doc\n\nThis content stays searchable.",
+            title="kept_doc",
+            directory=str(temp_docs_dir),
+        )
+
+        assert result.get("status") == "stored_partial"
+        # The pre-existing chunks survive -- the fallback left the index alone.
+        assert _count_chunks() == chunks_before
+
+    @pytest.mark.asyncio
     async def test_add_to_library_with_tags(self, temp_docs_dir: Path, clean_db: Path) -> None:
         """Test adding content to the library with tags."""
         from librarian.server import add_to_library
@@ -296,6 +383,212 @@ class TestSearchTools:
         results = await search_library(context=CTX, query="", limit=5)
         assert results == []
 
+    @pytest.mark.asyncio
+    async def test_search_library_include_deleted_opt_in(
+        self, temp_docs_dir: Path, clean_db: Path
+    ) -> None:
+        """search_library hides soft-deleted chunks by default; opt-in surfaces them."""
+        from librarian.server import index_directory_to_library, search_library
+        from librarian.storage.factory import get_storage
+        from librarian.types import SearchMode
+
+        await index_directory_to_library(context=CTX, directory=str(temp_docs_dir))
+
+        # Soft-delete every indexed document (tombstone, not hard delete).
+        storage = get_storage()
+        with storage.transaction() as conn:
+            doc_ids = [
+                row["document_id"]
+                for row in conn.execute("SELECT document_id FROM documents").fetchall()
+            ]
+            for did in doc_ids:
+                storage.soft_delete_document(conn, did, "test tombstone")
+        assert doc_ids
+
+        # Default: tombstoned content is excluded.
+        default_hits = await search_library(
+            context=CTX, query="test", mode=SearchMode.KEYWORD, limit=10
+        )
+        assert default_hits == []
+
+        # Opt-in: the soft-deleted chunks come back.
+        opted_in = await search_library(
+            context=CTX,
+            query="test",
+            mode=SearchMode.KEYWORD,
+            limit=10,
+            include_deleted=True,
+        )
+        assert opted_in != []
+
+
+class TestExpandContext:
+    """Tests for the expand_context MCP tool."""
+
+    @staticmethod
+    def _multi_section_doc(tmp_path: Path) -> Path:
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        sections = [
+            f"## Section {i}\n\n" + f"Body of section {i}. distinctword{i} " * 20 for i in range(5)
+        ]
+        (docs / "thread.md").write_text("# Conversation\n\n" + "\n\n".join(sections))
+        return docs
+
+    @pytest.mark.asyncio
+    async def test_expand_context_returns_ordered_neighbors(
+        self, tmp_path: Path, clean_db: Path
+    ) -> None:
+        from librarian.server import expand_context, index_directory_to_library
+        from librarian.storage.factory import get_metadata_store
+
+        docs = self._multi_section_doc(tmp_path)
+        await index_directory_to_library(context=CTX, directory=str(docs))
+
+        # Grab the ordered chunk ids straight from storage so we can anchor on a
+        # known middle chunk and assert the exact window deterministically.
+        db = get_metadata_store()
+        with db._connection() as conn:  # type: ignore[attr-defined]
+            ordered = [
+                row["chunk_id"]
+                for row in conn.execute(
+                    "SELECT chunk_id FROM chunks ORDER BY chunk_index"
+                ).fetchall()
+            ]
+        assert len(ordered) >= 5, "doc should chunk into several sections"
+
+        middle = len(ordered) // 2
+        anchor = ordered[middle]
+        neighbors = await expand_context(context=CTX, chunk_id=anchor, before=2, after=2)
+
+        returned_ids = [n["chunk_id"] for n in neighbors]
+        assert anchor not in returned_ids  # anchor itself is not repeated
+        assert len(neighbors) == 4
+        # Neighbors come back in source order and carry the v0.14 shape.
+        indices = [n["chunk_index"] for n in neighbors]
+        assert indices == sorted(indices)
+        for n in neighbors:
+            assert isinstance(n["chunk_id"], str)
+            assert n["chunk_source_uri"] and n["chunk_source_uri"].startswith("file://")
+
+    @pytest.mark.asyncio
+    async def test_expand_context_clips_at_boundary(self, tmp_path: Path, clean_db: Path) -> None:
+        from librarian.server import expand_context, index_directory_to_library
+        from librarian.storage.factory import get_metadata_store
+
+        docs = self._multi_section_doc(tmp_path)
+        await index_directory_to_library(context=CTX, directory=str(docs))
+
+        db = get_metadata_store()
+        with db._connection() as conn:  # type: ignore[attr-defined]
+            first = conn.execute(
+                "SELECT chunk_id FROM chunks ORDER BY chunk_index LIMIT 1"
+            ).fetchone()["chunk_id"]
+
+        neighbors = await expand_context(context=CTX, chunk_id=first, before=2, after=2)
+        # No chunks precede the first, so only the following neighbors come back.
+        assert 1 <= len(neighbors) <= 2
+        assert all(n["chunk_index"] >= 1 for n in neighbors)
+
+    @pytest.mark.asyncio
+    async def test_expand_context_blank_chunk_id_raises(self, clean_db: Path) -> None:
+        from librarian.server import expand_context
+
+        with pytest.raises(RetryableToolError):
+            await expand_context(context=CTX, chunk_id="  ")
+
+    @pytest.mark.asyncio
+    async def test_expand_context_unknown_chunk_raises(self, clean_db: Path) -> None:
+        from librarian.server import expand_context
+        from librarian.storage.factory import get_storage
+
+        # Migrate the (empty) DB so the lookup reaches the v0.14 schema and the
+        # unknown id resolves to "no chunk found" rather than a missing column.
+        get_storage()
+
+        with pytest.raises(RetryableToolError):
+            await expand_context(context=CTX, chunk_id="no-such-chunk")
+
+    @pytest.mark.asyncio
+    async def test_expand_context_unmigrated_db_degrades_gracefully(self, clean_db: Path) -> None:
+        """A serve-only process on a never-migrated DB gets a retryable error, not a crash.
+
+        Without ingest running in-process the read path never adds
+        ``chunks.chunk_id``; the tool must degrade like search_library rather
+        than surfacing a non-retryable backend error.
+        """
+        from librarian.server import expand_context
+
+        with pytest.raises(RetryableToolError):
+            await expand_context(context=CTX, chunk_id="anything")
+
+    @pytest.mark.asyncio
+    async def test_expand_context_single_chunk_returns_empty(
+        self, tmp_path: Path, clean_db: Path
+    ) -> None:
+        """A single-chunk document has no neighbors -> [] (not an error)."""
+        from librarian.server import expand_context, index_directory_to_library
+        from librarian.storage.factory import get_metadata_store
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "solo.md").write_text("# Solo\n\nOne short paragraph.")
+        await index_directory_to_library(context=CTX, directory=str(docs))
+
+        db = get_metadata_store()
+        with db._connection() as conn:  # type: ignore[attr-defined]
+            rows = conn.execute("SELECT chunk_id FROM chunks").fetchall()
+        assert len(rows) == 1
+        assert await expand_context(context=CTX, chunk_id=rows[0]["chunk_id"]) == []
+
+    @pytest.mark.asyncio
+    async def test_expand_context_tombstoned_suggests_include_deleted(
+        self, tmp_path: Path, clean_db: Path
+    ) -> None:
+        """Tombstoned neighbors under the default flag steer the agent to include_deleted."""
+        from librarian.server import expand_context, index_directory_to_library
+        from librarian.storage.factory import get_metadata_store, get_storage
+
+        docs = self._multi_section_doc(tmp_path)
+        await index_directory_to_library(context=CTX, directory=str(docs))
+
+        db = get_metadata_store()
+        with db._connection() as conn:  # type: ignore[attr-defined]
+            ordered = [
+                row["chunk_id"]
+                for row in conn.execute(
+                    "SELECT chunk_id FROM chunks ORDER BY chunk_index"
+                ).fetchall()
+            ]
+        anchor = ordered[len(ordered) // 2]
+
+        # Tombstone the whole document (soft-delete tombstones every chunk).
+        storage = get_storage()
+        with storage.transaction() as conn:
+            for did in [
+                row["document_id"]
+                for row in conn.execute("SELECT document_id FROM documents").fetchall()
+            ]:
+                storage.soft_delete_document(conn, did, "test tombstone")
+
+        # Default flag: the neighbors exist but are tombstoned -> guided to the flag.
+        with pytest.raises(RetryableToolError) as exc:
+            await expand_context(context=CTX, chunk_id=anchor, before=2, after=2)
+        assert "include_deleted" in str(exc.value.additional_prompt_content)
+
+        # Opt-in: neighbors come back, each flagged with its deleted_at tombstone.
+        neighbors = await expand_context(
+            context=CTX, chunk_id=anchor, before=2, after=2, include_deleted=True
+        )
+        assert neighbors
+        assert all(n["deleted_at"] for n in neighbors)
+
+    def test_expand_context_is_reexportable(self) -> None:
+        """Consumers re-export the tool by importing it from the server module."""
+        from librarian.server import expand_context
+
+        assert callable(expand_context)
+
 
 class TestDocumentManagementTools:
     """Tests for document management tools."""
@@ -341,8 +634,15 @@ class TestDocumentManagementTools:
         file_path = temp_docs_dir / "test1.md"
         result = await remove_from_library(context=CTX, path=str(file_path), delete_file=True)
 
+        # Index removal routes through the storage factory (delete_document_by_path).
+        assert result.get("removed_from_index") is True
         assert result.get("file_deleted") is True
         assert not file_path.exists()
+
+        # The document is gone from the index: a second removal is a no-op.
+        from librarian.storage.factory import get_metadata_store
+
+        assert get_metadata_store().get_document_by_path(str(file_path)) is None
 
     @pytest.mark.asyncio
     async def test_list_library_contents(self, temp_docs_dir: Path, clean_db: Path) -> None:
@@ -357,6 +657,12 @@ class TestDocumentManagementTools:
         result = await list_library_contents(context=CTX, limit=100)
         assert isinstance(result, list)
         assert len(result) >= 2
+
+        # A negative limit (agents' "-1 = no limit" convention) must not reach
+        # SQL: it errors on Postgres and returns everything on SQLite. It's
+        # clamped to "no bound" and returns the full list without raising.
+        unbounded = await list_library_contents(context=CTX, limit=-1)
+        assert len(unbounded) == len(result)
 
     @pytest.mark.asyncio
     async def test_get_library_overview_stats(self, clean_db: Path) -> None:

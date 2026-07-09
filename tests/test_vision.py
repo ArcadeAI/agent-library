@@ -371,8 +371,13 @@ def test_pdf_ocr_produces_page_chunks_with_ocr_text(
 
 def test_registry_threads_pdf_ocr_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("pypdf")
-    monkeypatch.setenv("PDF_OCR_ENABLED", "true")
+    from librarian.processing.parsers import pdf as pdf_module
     from librarian.processing.parsers.registry import ParserRegistry
+
+    # Isolate "registry threads the flag" from OCR-dependency availability:
+    # pretend the OCR deps are present so PDFParser(enable_ocr=True) constructs.
+    monkeypatch.setenv("PDF_OCR_ENABLED", "true")
+    monkeypatch.setattr(pdf_module, "OCR_AVAILABLE", True, raising=False)
 
     parser, asset_type = ParserRegistry().get_parser(Path("doc.pdf"))
     assert asset_type == AssetType.PDF

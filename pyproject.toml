@@ -62,10 +62,12 @@ pdf = [
 ]
 postgres = [
     "psycopg[binary]>=3.1.0",
+    "psycopg-pool>=3.2.0",
 ]
 ocr = [
     "pytesseract>=0.3.10",
     "Pillow>=10.0.0",
+    "pdf2image>=1.16.0",
 ]
 vision = [
     "Pillow>=10.0.0",
@@ -150,10 +152,14 @@ forbidden_modules = [
     "librarian.storage.fts_store",
 ]
 ignore_imports = [
-    # SQLite-only maintenance/backcompat paths. Normal app-facing read/write
-    # paths must go through librarian.storage.factory.
+    # Genuinely SQLite-only admin commands with no backend-agnostic equivalent
+    # on the Storage protocol: `libr index clean/build` (clear_all) and
+    # `libr index clobber` (unlink the .db file). `libr sources rm` and the
+    # server's removal/no-embedding-fallback paths now route through
+    # librarian.storage.factory (delete_document_by_path / write_upsert) and
+    # honor STORAGE_BACKEND. Normal app-facing read/write paths must go through
+    # the factory.
     "librarian.cli -> librarian.storage.database",
-    "librarian.server -> librarian.storage.database",
 ]
 # Direct imports only: these modules may depend on concrete backends through
 # librarian.storage.factory, which is the approved substrate-selection boundary.

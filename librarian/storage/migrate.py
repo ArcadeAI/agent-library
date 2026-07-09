@@ -173,6 +173,12 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_document_id ON documents(document_id)"
     )
+    # Supports list_documents' ``ORDER BY updated_at DESC, id DESC`` so a
+    # paginated read is an index-ordered scan rather than a full scan + sort.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_documents_updated_at_id "
+        "ON documents(updated_at DESC, id DESC)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_chunk_id ON chunks(chunk_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_deleted_at ON chunks(deleted_at)")
 

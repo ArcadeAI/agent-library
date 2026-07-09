@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from librarian.types import AssetType, Document, EmbeddingModality
 
 __all__ = [
+    "ChunkContext",
     "FTSStore",
     "MetadataStore",
     "StateStore",
@@ -67,6 +68,27 @@ class SyncState:
     config_version: int = 0
 
 
+@dataclass
+class ChunkContext:
+    """One chunk in an :meth:`MetadataStore.get_chunk_context` window.
+
+    Carries both identity forms: the deterministic public ``chunk_id`` (TEXT,
+    what search returns) and the internal ``internal_id`` surrogate
+    (``chunks.id``). ``document_id`` is the internal ``documents.id``.
+    """
+
+    chunk_id: str | None
+    internal_id: int
+    document_id: int
+    document_path: str
+    content: str
+    heading_path: str | None
+    chunk_index: int
+    asset_type: str
+    chunk_source_uri: str | None
+    deleted_at: str | None = None
+
+
 @runtime_checkable
 class MetadataStore(Protocol):
     """Read access to document metadata."""
@@ -79,6 +101,8 @@ class MetadataStore(Protocol):
         self,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> "list[Document]": ...
 
     def get_document_ids_in_timerange(
@@ -86,6 +110,16 @@ class MetadataStore(Protocol):
     ) -> list[int]: ...
 
     def get_chunk_public_fields(self, chunk_ids: list[int]) -> dict[int, dict[str, Any]]: ...
+
+    def get_chunk_context(
+        self,
+        chunk_id: str,
+        before: int = 2,
+        after: int = 2,
+        include_deleted: bool = False,
+    ) -> list[ChunkContext]: ...
+
+    def chunk_exists(self, chunk_id: str) -> bool: ...
 
     def get_stats(self) -> dict[str, Any]: ...
 
@@ -104,6 +138,7 @@ class VectorStore(Protocol):
         query_embedding: list[float],
         limit: int = 10,
         min_similarity: float = 0.0,
+        include_deleted: bool = False,
     ) -> "list[VectorSearchResult]": ...
 
     def search_by_modality(
@@ -112,6 +147,7 @@ class VectorStore(Protocol):
         modality: "EmbeddingModality",
         limit: int = 10,
         min_similarity: float = 0.0,
+        include_deleted: bool = False,
     ) -> "list[VectorSearchResult]": ...
 
     def get_embedding(
@@ -130,6 +166,7 @@ class FTSStore(Protocol):
         query: str,
         limit: int = 10,
         snippet_length: int = 64,
+        include_deleted: bool = False,
     ) -> "list[FTSSearchResult]": ...
 
 
@@ -196,3 +233,14 @@ class Storage(Protocol):
     def documents_to_reprocess(
         self, asset_type: "AssetType", status_key: str, status_value: str
     ) -> list[str]: ...
+
+    def delete_document_by_path(self, path: str) -> bool:
+        """Hard-delete a document (and its chunks/embeddings) by file path.
+
+        The backend-agnostic admin removal path: routed through the storage
+        factory so it honors ``STORAGE_BACKEND`` instead of always hitting
+        SQLite. Returns ``True`` when a document was removed, ``False`` when no
+        document matched the path. Commits on its own (it is not part of an
+        orchestrator transaction).
+        """
+        ...
