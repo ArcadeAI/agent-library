@@ -24,6 +24,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from librarian.storage._common import dumps_or_none as _dumps_or_none
 from librarian.storage._common import iso as _iso
 from librarian.storage._common import json_default as _json_default
 from librarian.storage._common import modality_table as _modality_table
@@ -310,11 +311,7 @@ class SQLiteStorage:
         self, conn: sqlite3.Connection, doc_pk: int, prepared: PreparedDocument
     ) -> None:
         for chunk in prepared.chunks:
-            modality_data_json = (
-                json.dumps(chunk.modality_data, default=_json_default)
-                if chunk.modality_data
-                else None
-            )
+            modality_data_json = _dumps_or_none(chunk.modality_data)
             cursor = conn.execute(
                 """
                 INSERT INTO chunks (

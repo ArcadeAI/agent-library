@@ -17,6 +17,7 @@ is optional; callers that inject their own describer (e.g. tests) need neither.
 import base64
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -26,13 +27,36 @@ from librarian.config import VLM_MAX_TOKENS, VLM_MODEL, VLM_PROVIDER
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "VLM_SUPPORTED_MIME",
     "BaseVisionDescriber",
     "LLMVisionDescriber",
     "VisionError",
     "VisionResult",
     "get_vision_describer",
     "guess_image_mime",
+    "is_vlm_supported_mime",
 ]
+
+# Media types every supported hosted VLM accepts. Anthropic's messages API
+# restricts image ``media_type`` to these four, and OpenAI vision input is the
+# same set (non-animated GIF); .bmp/.tiff are recognised as images by the parser
+# registry but no provider ingests them, so they are marked terminally
+# ``unsupported`` rather than retried forever.
+VLM_SUPPORTED_MIME: frozenset[str] = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+})
+
+
+def is_vlm_supported_mime(mime: str) -> bool:
+    """Whether a hosted VLM provider accepts this image media type."""
+    return mime in VLM_SUPPORTED_MIME
+
+
+# A fenced reply -- ```json ... ``` or ``` ... ``` -- on one or many lines.
+_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 
 # The single prompt sent with every image. We ask for a strict JSON object so
 # the description and the verbatim transcription stay separable downstream.
@@ -102,13 +126,10 @@ def parse_vlm_response(raw: str) -> VisionResult:
     if not text:
         raise VisionError("VLM returned an empty response")
 
-    candidate = text
-    if candidate.startswith("```"):
-        # Strip a leading ```json / ``` fence and the trailing fence.
-        candidate = candidate.split("\n", 1)[-1] if "\n" in candidate else ""
-        if candidate.endswith("```"):
-            candidate = candidate[: -len("```")]
-        candidate = candidate.strip()
+    # Strip a surrounding markdown fence if present (handles single-line
+    # ```{...}``` as well as multi-line ```json\n...\n```).
+    match = _FENCE_RE.match(text)
+    candidate = match.group(1).strip() if match else text
 
     try:
         data = json.loads(candidate)
@@ -116,9 +137,11 @@ def parse_vlm_response(raw: str) -> VisionResult:
         data = None
 
     if isinstance(data, dict):
+        # ``or ""`` (not a ``.get`` default) so an explicit JSON ``null`` -- which
+        # models emit for absent text -- doesn't become the literal string "None".
         return VisionResult(
-            description=str(data.get("description", "")),
-            transcribed_text=str(data.get("text", "")),
+            description=str(data.get("description") or ""),
+            transcribed_text=str(data.get("text") or ""),
         )
     # Not JSON: keep the whole reply as the description.
     return VisionResult(description=text)
@@ -226,7 +249,15 @@ class LLMVisionDescriber(BaseVisionDescriber):
                 },
             ],
         )
-        return response.choices[0].message.content or ""
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            # A truncated reply is almost certainly invalid JSON mid-string;
+            # raise so the image lands in the retryable 'failed' state instead of
+            # storing the garbage prefix with status 'ok'.
+            raise VisionError(
+                "VLM response truncated at max_tokens; raise VLM_MAX_TOKENS and retry"
+            )
+        return choice.message.content or ""
 
     def _call_anthropic(self, b64: str, mime_type: str) -> str:
         response = self.client.messages.create(
@@ -250,6 +281,10 @@ class LLMVisionDescriber(BaseVisionDescriber):
                 }
             ],
         )
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise VisionError(
+                "VLM response truncated at max_tokens; raise VLM_MAX_TOKENS and retry"
+            )
         parts = [getattr(block, "text", "") for block in response.content]
         return "".join(parts)
 

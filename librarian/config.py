@@ -5,7 +5,6 @@ Centralized configuration with environment variable overrides and
 sensible defaults for all system parameters.
 """
 
-import logging
 import os
 from pathlib import Path
 
@@ -184,7 +183,8 @@ ENABLE_VISION_EMBEDDINGS = safe_bool(os.getenv("ENABLE_VISION_EMBEDDINGS"), Fals
 VISION_EMBEDDING_MODEL = os.getenv("VISION_EMBEDDING_MODEL", "clip-ViT-B-32")
 VISION_EMBEDDING_DIMENSION = safe_int(os.getenv("VISION_EMBEDDING_DIMENSION"), 512)
 
-if os.getenv("ENABLE_VISION_EMBEDDINGS") and ENABLE_VISION_EMBEDDINGS:
+if ENABLE_VISION_EMBEDDINGS:
+    # The default is False, so a True value means the user explicitly set it.
     import warnings as _warnings
 
     _warnings.warn(
@@ -194,10 +194,6 @@ if os.getenv("ENABLE_VISION_EMBEDDINGS") and ENABLE_VISION_EMBEDDINGS:
         "a vision model instead. This flag will be removed in a future release.",
         DeprecationWarning,
         stacklevel=2,
-    )
-    logging.getLogger(__name__).warning(
-        "ENABLE_VISION_EMBEDDINGS=true is deprecated and ignored in v0.14; "
-        "images use the VLM-text pipeline (see IMAGE_GENERATE_CAPTIONS)."
     )
 
 # =============================================================================
@@ -290,8 +286,10 @@ IMAGE_CAPTION_MODEL = os.getenv("IMAGE_CAPTION_MODEL", "blip-base")
 # VLM call returns a description + transcribed text, which becomes the chunk's
 # text content for ordinary text embedding.
 
-# Which provider backs the VLM caller: "openai" or "anthropic".
-VLM_PROVIDER = os.getenv("VLM_PROVIDER", "openai")
+# Which provider backs the VLM caller: "openai" or "anthropic". Normalized once
+# here (lower-cased) so a capitalized value like "OpenAI" can't slip past the
+# per-provider model default and pair the OpenAI client with the Claude model.
+VLM_PROVIDER = os.getenv("VLM_PROVIDER", "openai").strip().lower()
 # Default to vision-capable hosted models per provider.
 VLM_MODEL = os.getenv(
     "VLM_MODEL", "gpt-4o" if VLM_PROVIDER == "openai" else "claude-3-5-sonnet-20241022"

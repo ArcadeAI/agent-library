@@ -18,6 +18,7 @@ The hosted VLM is always injected as a fake, so these run without network,
 Pillow, or the provider SDKs.
 """
 
+import asyncio
 import importlib
 from pathlib import Path
 
@@ -198,6 +199,34 @@ def test_llm_describer_wraps_client_errors_as_vision_error() -> None:
         describer.describe(b"bytes", "image/png")
 
 
+def test_parse_vlm_response_null_text_not_stringified() -> None:
+    # A JSON null for an absent key must not become the literal "None".
+    result = parse_vlm_response('{"description": "a chart", "text": null}')
+    assert result.transcribed_text == ""
+    assert "None" not in result.content
+
+
+def test_parse_vlm_response_single_line_fenced_json() -> None:
+    result = parse_vlm_response('```{"description": "boxed", "text": "x"}```')
+    assert result.description == "boxed"
+    assert result.transcribed_text == "x"
+
+
+def test_llm_describer_raises_on_truncated_openai_response() -> None:
+    from types import SimpleNamespace
+
+    class _Completions:
+        def create(self, **kwargs: object) -> object:
+            message = SimpleNamespace(content='{"description": "a very long')
+            choice = SimpleNamespace(message=message, finish_reason="length")
+            return SimpleNamespace(choices=[choice])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    describer = LLMVisionDescriber(provider="openai", client=client)
+    with pytest.raises(VisionError, match="truncated"):
+        describer.describe(b"bytes", "image/png")
+
+
 # =============================================================================
 # AC: caption on -> VLM description + transcribed text becomes the chunk content
 # =============================================================================
@@ -334,6 +363,119 @@ def test_documents_to_reprocess_rejects_bad_key(storage: SQLiteStorage) -> None:
 
 
 # =============================================================================
+# Review fixes: unsupported formats, uncaptioned backfill, migration, semantic
+# =============================================================================
+
+
+def test_unsupported_image_format_is_terminal_not_failed(
+    storage: SQLiteStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # .bmp/.tiff are rejected by every VLM provider: mark 'unsupported' (which
+    # reprocess does NOT match) instead of looping forever on 'failed'.
+    monkeypatch.setattr(config, "IMAGE_GENERATE_CAPTIONS", True)
+    describer = FakeVisionDescriber()
+    img = _write_png(tmp_path, name="scan.bmp")
+    orch = Orchestrator(storage=storage, embedder=FakeEmbedder(), vision_describer=describer)
+
+    orch.index_file(img)
+
+    assert describer.calls == 0, "unsupported formats must not hit the VLM"
+    chunks = _chunks(storage)
+    assert '"processing_status": "unsupported"' in chunks[0]["modality_data"]
+    # reprocess (matches 'failed' by default) leaves it alone.
+    assert storage.documents_to_reprocess(AssetType.IMAGE, "processing_status", "failed") == []
+
+
+def test_caption_off_tags_uncaptioned_and_backfills(
+    storage: SQLiteStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Indexed with captions off -> 'uncaptioned'; later reprocess with a VLM
+    # backfills the caption (the documented backfill story for #8).
+    monkeypatch.setattr(config, "IMAGE_GENERATE_CAPTIONS", False)
+    img = _write_png(tmp_path)
+    Orchestrator(storage=storage, embedder=FakeEmbedder()).index_file(img)
+
+    targets = storage.documents_to_reprocess(AssetType.IMAGE, "processing_status", "uncaptioned")
+    assert str(img) in targets
+
+    monkeypatch.setattr(config, "IMAGE_GENERATE_CAPTIONS", True)
+    good = FakeVisionDescriber(VisionResult(description="now captioned", transcribed_text=""))
+    Orchestrator(storage=storage, embedder=FakeEmbedder(), vision_describer=good).index_file(img)
+
+    chunks = _chunks(storage)
+    assert "now captioned" in chunks[0]["content"]
+    assert '"processing_status": "ok"' in chunks[0]["modality_data"]
+
+
+def test_migration_v2_adds_modality_data_column(tmp_path: Path) -> None:
+    # Finding #1: a v0.14.0/0.14.1 chunks table lacks modality_data. The v2
+    # migration (run from Database._init_schema on every open, read path
+    # included) must add it so the public-fields SELECT can't crash.
+    import sqlite3
+
+    from librarian.storage.migrations import migrate_to_v2_chunk_modality_data
+
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY, chunk_id TEXT)")
+    conn.commit()
+    assert "modality_data" not in {
+        r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()
+    }
+
+    migrate_to_v2_chunk_modality_data(conn)
+
+    assert "modality_data" in {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    # Idempotent: a second run is a no-op, not an error.
+    migrate_to_v2_chunk_modality_data(conn)
+    conn.close()
+
+
+def test_semantic_image_search_does_not_route_to_vision_table(
+    clean_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding #2: a semantic image search must NOT query the retired VISION table
+    # (which the pipeline never writes to -> silent []); it falls through to the
+    # TEXT vector path. Asserting the routing directly avoids the flakiness of
+    # random fake-embedding cosine scores.
+    monkeypatch.setattr(config, "IMAGE_GENERATE_CAPTIONS", True)
+    from librarian.retrieval.search import HybridSearcher
+    from librarian.server import search_library
+    from librarian.storage.factory import get_storage
+    from librarian.types import AssetType as LibAssetType
+    from librarian.types import EmbeddingModality, SearchMode
+
+    describer = FakeVisionDescriber(
+        VisionResult(description="a wiring diagram", transcribed_text="")
+    )
+    Orchestrator(
+        storage=get_storage(), embedder=FakeEmbedder(), vision_describer=describer
+    ).index_file(_write_png(tmp_path))
+
+    modalities_queried: list[EmbeddingModality] = []
+    real = HybridSearcher.vector_search_by_modality
+
+    def _spy(
+        self: HybridSearcher, query: str, modality: EmbeddingModality, *a: object, **k: object
+    ):
+        modalities_queried.append(modality)
+        return real(self, query, modality, *a, **k)
+
+    monkeypatch.setattr(HybridSearcher, "vector_search_by_modality", _spy)
+
+    asyncio.run(
+        search_library(
+            context=None,  # type: ignore[arg-type]
+            query="wiring diagram",
+            mode=SearchMode.SEMANTIC,
+            asset_type=LibAssetType.IMAGE,
+            limit=10,
+        )
+    )
+    assert EmbeddingModality.VISION not in modalities_queried
+
+
+# =============================================================================
 # AC: PDF with image pages (PDF_OCR_ENABLED=true) -> page chunks with OCR text
 # =============================================================================
 
@@ -382,6 +524,30 @@ def test_registry_threads_pdf_ocr_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     parser, asset_type = ParserRegistry().get_parser(Path("doc.pdf"))
     assert asset_type == AssetType.PDF
     assert getattr(parser, "enable_ocr", False) is True
+
+
+def test_pdf_ocr_requested_but_unavailable_is_reprocessable(
+    storage: SQLiteStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding #3: a scanned PDF that yields no text with OCR deps missing must
+    # record a retryable status (not silently index empty) and be discoverable
+    # by `libr reprocess`, including for the PDF asset type.
+    pypdf = pytest.importorskip("pypdf")
+    from librarian.processing.parsers import pdf as pdf_module
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    pdf_path = tmp_path / "scan.pdf"
+    with pdf_path.open("wb") as fh:
+        writer.write(fh)
+
+    monkeypatch.setenv("PDF_OCR_ENABLED", "true")
+    monkeypatch.setattr(pdf_module, "OCR_AVAILABLE", False, raising=False)
+
+    Orchestrator(storage=storage, embedder=FakeEmbedder()).index_file(pdf_path)
+
+    targets = storage.documents_to_reprocess(AssetType.PDF, "processing_status", "ocr_unavailable")
+    assert str(pdf_path) in targets
 
 
 # =============================================================================
@@ -473,4 +639,17 @@ def test_enable_vision_embeddings_is_deprecated(monkeypatch: pytest.MonkeyPatch)
     finally:
         # Restore the module to its env-clean state for the rest of the session.
         monkeypatch.delenv("ENABLE_VISION_EMBEDDINGS", raising=False)
+        importlib.reload(config)
+
+
+def test_vlm_provider_is_case_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Finding #5: a capitalized VLM_PROVIDER must still pair with the right model.
+    monkeypatch.setenv("VLM_PROVIDER", "OpenAI")
+    monkeypatch.delenv("VLM_MODEL", raising=False)
+    try:
+        importlib.reload(config)
+        assert config.VLM_PROVIDER == "openai"
+        assert config.VLM_MODEL == "gpt-4o"
+    finally:
+        monkeypatch.delenv("VLM_PROVIDER", raising=False)
         importlib.reload(config)

@@ -43,11 +43,18 @@ from librarian.processing.vision import (
     BaseVisionDescriber,
     get_vision_describer,
     guess_image_mime,
+    is_vlm_supported_mime,
 )
 from librarian.storage.factory import get_storage
 from librarian.storage.protocols import SyncState
 from librarian.storage.write_models import PreparedChunk, PreparedDocument
-from librarian.types import AssetType, EmbeddingModality, ParsedDocument, TextChunk
+from librarian.types import (
+    AssetType,
+    EmbeddingModality,
+    ParsedDocument,
+    ProcessingStatus,
+    TextChunk,
+)
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -238,6 +245,12 @@ class Orchestrator:
     def _prepare_upsert(self, connector: Connector, event: DocumentUpsert) -> PreparedDocument:
         document_id = ids.document_id(connector.name, event.source_type, event.source_native_id)
 
+        # Document-level modality_data (e.g. a PDF's OCR processing_status) is
+        # applied to every chunk that doesn't carry its own, so per-asset status
+        # reaches ``chunks.modality_data`` for all types -- not just the single
+        # image chunk -- and ``libr reprocess`` works for every asset the CLI
+        # advertises.
+        doc_modality_data: dict[str, Any] | None = None
         if event.chunks is not None:
             text_chunks, asset_type, native_ids = self._chunks_from_inputs(event)
             content = "\n\n".join(c.content for c in text_chunks)
@@ -248,6 +261,7 @@ class Orchestrator:
             native_ids = [f"{event.source_native_id}#chunk={i}" for i in range(len(text_chunks))]
             content = parsed.content
             title = event.title if event.title is not None else parsed.title
+            doc_modality_data = parsed.modality_data or None
 
         chunk_ids = [
             ids.chunk_id(connector.name, event.source_type, native_ids[i])
@@ -277,7 +291,7 @@ class Orchestrator:
                 modality=modality,
                 embedding=embedding,
                 model_version=model_version,
-                modality_data=chunk.modality_data,
+                modality_data=chunk.modality_data or doc_modality_data,
             )
             for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings, strict=True))
         ]
@@ -364,56 +378,71 @@ class Orchestrator:
         With ``IMAGE_GENERATE_CAPTIONS`` on, a single VLM call produces the
         description + transcribed text used as the chunk content (the failure
         path records ``processing_status='failed'`` so ``libr reprocess`` can
-        retry). With the flag off, the image becomes a metadata-only chunk via
-        the PIL-based parser (or a minimal placeholder when PIL is absent).
+        retry). With the flag off, the image becomes a metadata-only chunk tagged
+        ``uncaptioned`` so it can be back-filled later with
+        ``libr reprocess --where processing_status=uncaptioned``.
         """
         if _config.IMAGE_GENERATE_CAPTIONS:
             return self._describe_image(event, path)
 
         title = event.title or path.stem
+        # Metadata-only path. Tag it 'uncaptioned' (not a bare skip) so enabling
+        # captions later has a documented backfill query -- index_file re-ingests
+        # unconditionally, bypassing the mtime cursor that would otherwise skip
+        # an unchanged file on `libr add`.
         if parser is not None:
-            return parser.parse_file(path)
+            parsed = parser.parse_file(path)
+            parsed.modality_data = {
+                **(parsed.modality_data or {}),
+                "processing_status": ProcessingStatus.UNCAPTIONED.value,
+            }
+            return parsed
         # No captions and no Pillow: still index the asset, minimally.
         content = f"Image: {path.name}"
-        return ParsedDocument(
-            path=str(path),
-            title=title,
-            content=content,
-            metadata={"file_type": "image"},
-            sections=[],
-            raw_content=content,
-            asset_type=AssetType.IMAGE,
-            modality_data={"processing_status": "skipped"},
-        )
+        return self._image_doc(path, title, content, ProcessingStatus.UNCAPTIONED)
 
     def _describe_image(self, event: DocumentUpsert, path: Path) -> ParsedDocument:
         """Run the VLM on an image, recording success or a retryable failure."""
         title = event.title or path.stem
+        mime_type = guess_image_mime(path.suffix)
+
+        # Terminal skip for formats no VLM provider accepts (.bmp/.tiff): mark
+        # 'unsupported' (which reprocess deliberately does not match) rather than
+        # 'failed', so these don't churn through an unwinnable retry loop.
+        if not is_vlm_supported_mime(mime_type):
+            return self._image_doc(
+                path,
+                title,
+                f"[image, unsupported format: {path.suffix.lstrip('.') or mime_type}]",
+                ProcessingStatus.UNSUPPORTED,
+                mime_type=mime_type,
+            )
+
         describer = self._get_vision_describer()
         if describer is None:
             return self._image_doc(
                 path,
                 title,
                 "[image, processing failed]",
-                "failed",
+                ProcessingStatus.FAILED,
                 error="no vision describer is configured",
             )
         try:
             image_bytes = (
                 event.raw_content if isinstance(event.raw_content, bytes) else safe_read_bytes(path)
             )
-            result = describer.describe(image_bytes, guess_image_mime(path.suffix))
+            result = describer.describe(image_bytes, mime_type)
         except Exception as e:
             logger.warning("VLM image description failed for %s: %s", path, e)
             return self._image_doc(
-                path, title, "[image, processing failed]", "failed", error=str(e)
+                path, title, "[image, processing failed]", ProcessingStatus.FAILED, error=str(e)
             )
 
         return self._image_doc(
             path,
             title,
             result.content or f"Image: {path.name}",
-            "ok",
+            ProcessingStatus.OK,
             caption=result.description,
             transcribed_text=result.transcribed_text,
             vlm_model=describer.model_name,
@@ -421,10 +450,10 @@ class Orchestrator:
 
     @staticmethod
     def _image_doc(
-        path: Path, title: str, content: str, status: str, **extra: Any
+        path: Path, title: str, content: str, status: ProcessingStatus, **extra: Any
     ) -> ParsedDocument:
         """Build an image :class:`ParsedDocument` carrying its processing status."""
-        modality_data: dict[str, Any] = {"processing_status": status, **extra}
+        modality_data: dict[str, Any] = {"processing_status": status.value, **extra}
         return ParsedDocument(
             path=str(path),
             title=title,
@@ -458,7 +487,27 @@ class Orchestrator:
             return chunk_code_by_blocks(parsed.content, language, parsed.metadata)
         if asset_type == AssetType.PDF:
             page_count = parsed.metadata.get("page_count", 1)
-            return self._pdf_chunker.chunk_by_pages(parsed.content, page_count, parsed.metadata)
+            pdf_chunks = self._pdf_chunker.chunk_by_pages(
+                parsed.content, page_count, parsed.metadata
+            )
+            if pdf_chunks:
+                return pdf_chunks
+            # A scanned/image-only PDF can extract to no text at all. Emit one
+            # placeholder chunk so the document is still represented -- and, via
+            # the doc-level modality_data fallback in _prepare_upsert, carries its
+            # ``processing_status`` (e.g. ocr_unavailable) so ``libr reprocess``
+            # can find and retry it instead of it vanishing with zero chunks.
+            placeholder = parsed.content.strip() or "[pdf, no text extracted]"
+            return [
+                TextChunk(
+                    content=placeholder,
+                    index=0,
+                    start_char=0,
+                    end_char=len(placeholder),
+                    heading_path=parsed.title,
+                    metadata=parsed.metadata,
+                )
+            ]
         if asset_type == AssetType.IMAGE:
             return [
                 TextChunk(

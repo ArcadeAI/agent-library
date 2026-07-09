@@ -35,7 +35,6 @@ from librarian.config import (
     DOCUMENTS_PATH,
     ENABLE_CODE_EMBEDDINGS,
     ENABLE_OPTIONAL_TOOLS,
-    ENABLE_VISION_EMBEDDINGS,
     HYBRID_ALPHA,
     MMR_LAMBDA,
     SEARCH_LIMIT,
@@ -877,10 +876,10 @@ async def search_library(
                 results = searcher.vector_search_by_modality(
                     query, EmbeddingModality.CODE, limit=limit, include_deleted=include_deleted
                 )
-            elif asset_type == AssetType.IMAGE and ENABLE_VISION_EMBEDDINGS:
-                results = searcher.vector_search_by_modality(
-                    query, EmbeddingModality.VISION, limit=limit, include_deleted=include_deleted
-                )
+            # Images are NOT routed to the VISION table: the v0.14 pipeline embeds
+            # image captions/OCR text in the TEXT space (CLIP retired, #53), so a
+            # VISION search would hit a table nothing writes to. They fall through
+            # to TEXT vector search + asset_type filter below.
             else:
                 results = searcher.vector_search(
                     query, limit=limit, include_deleted=include_deleted

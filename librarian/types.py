@@ -105,6 +105,29 @@ class SearchMode(str, Enum):
     KEYWORD = "keyword"
 
 
+class ProcessingStatus(str, Enum):
+    """Per-chunk processing outcome recorded in ``chunks.modality_data``.
+
+    Drives the ``libr reprocess`` retry loop (see the vision pipeline, #53):
+
+    - OK: content was produced successfully.
+    - FAILED: a transient failure (VLM/OCR error, missing config) -- retryable;
+      this is what ``libr reprocess`` matches by default.
+    - UNCAPTIONED: an image indexed with captions disabled -- retryable once
+      ``IMAGE_GENERATE_CAPTIONS`` is on (the backfill story).
+    - OCR_UNAVAILABLE: a PDF wanted OCR but the OCR dependencies were absent --
+      retryable once they're installed.
+    - UNSUPPORTED: a terminal skip (e.g. an image format no VLM provider
+      accepts); reprocess deliberately does not match this.
+    """
+
+    OK = "ok"
+    FAILED = "failed"
+    UNCAPTIONED = "uncaptioned"
+    OCR_UNAVAILABLE = "ocr_unavailable"
+    UNSUPPORTED = "unsupported"
+
+
 class LibraryView(str, Enum):
     """View selector for the unified get_library_overview tool.
 

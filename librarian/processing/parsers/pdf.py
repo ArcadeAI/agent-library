@@ -42,11 +42,13 @@ class PDFParser(BaseParser):
         if not PYPDF_AVAILABLE:
             raise ImportError("pypdf is required for PDF parsing. Install with: pip install pypdf")
 
-        self.enable_ocr = enable_ocr
-        if enable_ocr and not OCR_AVAILABLE:
-            raise ImportError(
-                "OCR dependencies required. Install with: pip install pytesseract pdf2image"
-            )
+        # OCR was requested vs. actually available: when the OCR deps are absent
+        # we still parse the PDF's text (rather than raising, which would drop
+        # the whole document) but record ``ocr_unavailable`` so a scanned PDF that
+        # produced no text is retryable via ``libr reprocess`` once deps land.
+        self.ocr_requested = enable_ocr
+        self.enable_ocr = enable_ocr and OCR_AVAILABLE
+        self.ocr_unavailable = enable_ocr and not OCR_AVAILABLE
 
     def parse_content(self, content: str, path: str = "") -> ParsedDocument:
         """
@@ -148,6 +150,21 @@ class PDFParser(BaseParser):
         # Determine title (use PDF metadata or filename)
         title = metadata.get("pdf_title") or file_path.stem
 
+        modality_data: dict[str, Any] = {"page_count": len(reader.pages)}
+        # Record a retryable processing_status so a scanned/image-only PDF that
+        # yielded no text isn't silently indexed empty -- ``libr reprocess`` can
+        # pick it up once OCR deps are installed (ocr_unavailable) or the source
+        # is fixed (failed). ``ProcessingStatus`` values are used as bare strings
+        # here to avoid a parser -> types cross-layer import churn.
+        if not full_text.strip():
+            modality_data["processing_status"] = (
+                "ocr_unavailable" if self.ocr_unavailable else "failed"
+            )
+        elif self.ocr_unavailable:
+            # Text extracted, but OCR was requested and unavailable: any image-only
+            # pages were skipped, so flag for a later OCR pass.
+            modality_data["processing_status"] = "ocr_unavailable"
+
         return ParsedDocument(
             path=str(file_path),
             title=title,
@@ -156,7 +173,7 @@ class PDFParser(BaseParser):
             sections=sections,
             raw_content=full_text,
             asset_type=AssetType.PDF,
-            modality_data={"page_count": len(reader.pages)},
+            modality_data=modality_data,
         )
 
     def _ocr_page(self, pdf_path: Path, page_num: int) -> str:

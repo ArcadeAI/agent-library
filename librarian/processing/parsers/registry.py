@@ -140,6 +140,9 @@ class ParserRegistry:
 
             # PDFs: thread the PDF_OCR_ENABLED flag through so image-only pages
             # get OCR'd. Re-read the env so tests/config changes take effect.
+            # PDFParser degrades to text-only (recording ``ocr_unavailable``) when
+            # OCR deps are missing rather than raising, so an ImportError here
+            # means pypdf itself is absent -> genuinely unsupported.
             if asset_type == AssetType.PDF:
                 import os
 
@@ -149,13 +152,6 @@ class ParserRegistry:
                 try:
                     return parser_class(enable_ocr=enable_ocr), asset_type  # type: ignore[call-arg]
                 except ImportError:
-                    # OCR deps may be missing while pypdf is present: fall back to
-                    # text-only parsing rather than dropping the PDF entirely.
-                    if enable_ocr:
-                        try:
-                            return parser_class(enable_ocr=False), asset_type  # type: ignore[call-arg]
-                        except ImportError:
-                            return None, AssetType.PDF
                     return None, AssetType.PDF
 
             return parser_class(), asset_type

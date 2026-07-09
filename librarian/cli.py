@@ -1596,6 +1596,13 @@ def reprocess_cmd(
         return
 
     rprint(f"Reprocessing [bold]{len(paths)}[/bold] {asset_type} document(s)...")
+
+    # Build one Orchestrator (and its vision describer + provider client) up front
+    # and reuse it across every document, rather than reconstructing the whole
+    # stack per file as `_index_path` would.
+    from librarian.orchestrator import Orchestrator
+
+    orchestrator = Orchestrator(storage=storage)
     reindexed = 0
     errors = 0
     for p in paths:
@@ -1605,7 +1612,9 @@ def reprocess_cmd(
             errors += 1
             continue
         try:
-            _index_path(fp, verbose)
+            orchestrator.index_file(fp)
+            if verbose:
+                rprint(f"  [green]+[/green] {p}")
             reindexed += 1
         except Exception as e:
             rprint(f"  [red]error:[/red] {p}: {e}")

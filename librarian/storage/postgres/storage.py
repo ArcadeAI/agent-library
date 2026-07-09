@@ -234,18 +234,18 @@ class PostgresStorage:
         ``modality_data->>status_key`` equals ``status_value``.
         """
         key = _validate_json_key(status_key)
-        conn = self._db._get_connection()
-        rows = conn.execute(
-            f"""
-            SELECT DISTINCT d.path
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.asset_type = %s
-              AND c.deleted_at IS NULL
-              AND c.modality_data->>'{key}' = %s
-            """,  # noqa: S608 - key validated to a bare identifier
-            (asset_type.value, status_value),
-        ).fetchall()
+        with self._db._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT d.path
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.asset_type = %s
+                  AND c.deleted_at IS NULL
+                  AND c.modality_data->>'{key}' = %s
+                """,  # noqa: S608 - key validated to a bare identifier
+                (asset_type.value, status_value),
+            ).fetchall()
         return [row["path"] for row in rows]
 
     def write_upsert(self, conn: Any, prepared: PreparedDocument) -> None:
