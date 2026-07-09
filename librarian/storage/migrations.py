@@ -116,6 +116,24 @@ def migrate_to_v1_multimodal(conn: sqlite3.Connection) -> None:
     logger.info("Migration v1 completed successfully")
 
 
+def migrate_to_v2_chunk_modality_data(conn: sqlite3.Connection) -> None:
+    """
+    Migration v2: Add the per-chunk ``modality_data`` JSON column.
+
+    The vision pipeline (#53) records a chunk's ``processing_status`` (and VLM
+    caption / transcription) here so failed images can be found and retried by
+    ``libr reprocess``. This runs from ``Database._init_schema`` on *every* open
+    -- read path included -- so a populated v0.14.0/0.14.1 index gains the column
+    before the first ``search_library`` selects it (the v0.14 ``migrate.py`` add
+    only runs on the write path).
+    """
+    cursor = conn.execute("PRAGMA table_info(chunks)")
+    chunk_columns = {row[1] for row in cursor.fetchall()}
+    if "modality_data" not in chunk_columns:
+        logger.info("Adding modality_data column to chunks table")
+        conn.execute("ALTER TABLE chunks ADD COLUMN modality_data JSON")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """
     Run all pending database migrations.
@@ -128,6 +146,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
     migrations = [
         (1, migrate_to_v1_multimodal),
+        (2, migrate_to_v2_chunk_modality_data),
     ]
 
     for version, migration_func in migrations:

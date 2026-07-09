@@ -155,11 +155,15 @@ def migrate(conn: Any, schema: str = "public") -> None:
                 deletion_reason TEXT,
                 document_source_uri TEXT,
                 chunk_source_uri TEXT,
+                modality_data JSONB,
                 content_tsv tsvector GENERATED ALWAYS AS
                     (to_tsvector('{fts_lang}', content)) STORED
             )
             """
         )
+        # Additive upgrade for tables created before modality_data existed
+        # (Postgres CREATE TABLE IF NOT EXISTS won't add new columns on re-run).
+        cur.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS modality_data JSONB")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_chunk_id ON chunks(chunk_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_deleted_at ON chunks(deleted_at)")

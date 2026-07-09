@@ -340,7 +340,8 @@ class PostgresDatabase:
             rows = conn.execute(
                 """
                 SELECT id, chunk_id, chunk_index, document_size,
-                       source_created_at, chunk_source_uri, deleted_at
+                       source_created_at, chunk_source_uri, deleted_at,
+                       modality_data
                 FROM chunks WHERE id = ANY(%s)
                 """,
                 (list(chunk_ids),),
@@ -353,6 +354,8 @@ class PostgresDatabase:
                 "source_created_at": row["source_created_at"],
                 "chunk_source_uri": row["chunk_source_uri"],
                 "deleted_at": row["deleted_at"],
+                # psycopg adapts a ``jsonb`` column straight to a dict (or None).
+                "modality_data": row["modality_data"],
             }
             for row in rows
         }

@@ -68,7 +68,11 @@ jobs:
         # --enable-loadable-sqlite-extensions, so sqlite-vec fails to load.
         # python-build-standalone enables loadable sqlite extensions on
         # every platform.
-        run: uv sync --extra dev --python-preference=only-managed
+        # Include the light optional extras the vision pipeline exercises:
+        # pdf (pypdf), ocr (Pillow + pytesseract) and vlm (openai/anthropic SDKs).
+        # These are torch-free, so they stay cheap; the heavy code/vision extras
+        # (torch) are intentionally left out of the default test run.
+        run: uv sync --extra dev --extra pdf --extra ocr --extra vlm --python-preference=only-managed
 
       - name: Run tests
         run: uv run pytest -v --cov --cov-config=pyproject.toml --cov-report=xml

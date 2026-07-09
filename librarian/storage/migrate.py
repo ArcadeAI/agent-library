@@ -46,6 +46,10 @@ _CHUNK_COLUMNS: dict[str, str] = {
     "deletion_reason": "TEXT",
     "document_source_uri": "TEXT",
     "chunk_source_uri": "TEXT",
+    # Per-chunk type-specific metadata as JSON. Holds the VLM vision pipeline's
+    # ``processing_status`` (and caption/transcription) so failed image chunks
+    # can be found and retried by ``libr reprocess``.
+    "modality_data": "JSON",
 }
 
 

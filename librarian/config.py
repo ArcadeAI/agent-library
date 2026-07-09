@@ -171,11 +171,30 @@ CODE_EMBEDDING_PROVIDER = os.getenv("CODE_EMBEDDING_PROVIDER", "local")
 # Vision Embedding Configuration
 # =============================================================================
 
-# Vision embeddings enabled by default for image search using CLIP
-ENABLE_VISION_EMBEDDINGS = safe_bool(os.getenv("ENABLE_VISION_EMBEDDINGS"), True)
+# DEPRECATED (v0.14, Slice 4 -- strategy "Option C / Hybrid"): CLIP-style image
+# embeddings are retired as an active path. Images now flow through the VLM-text
+# pipeline (see IMAGE_GENERATE_CAPTIONS) and embed in the TEXT space. This flag
+# now defaults to off and is a no-op: if a v0.13 user still has it set, we warn
+# once and ignore it. The dormant vec_chunks_vision table / VISION modality /
+# VISION_EMBEDDING_* keys are intentionally left in place for a clean v1.x
+# re-introduction of native image embeddings.
+ENABLE_VISION_EMBEDDINGS = safe_bool(os.getenv("ENABLE_VISION_EMBEDDINGS"), False)
 # Use sentence-transformers CLIP model name (not HuggingFace format)
 VISION_EMBEDDING_MODEL = os.getenv("VISION_EMBEDDING_MODEL", "clip-ViT-B-32")
 VISION_EMBEDDING_DIMENSION = safe_int(os.getenv("VISION_EMBEDDING_DIMENSION"), 512)
+
+if ENABLE_VISION_EMBEDDINGS:
+    # The default is False, so a True value means the user explicitly set it.
+    import warnings as _warnings
+
+    _warnings.warn(
+        "ENABLE_VISION_EMBEDDINGS is deprecated and has no effect as of v0.14: "
+        "CLIP-style image embeddings have been retired in favour of the VLM-text "
+        "vision pipeline. Set IMAGE_GENERATE_CAPTIONS=true to describe images with "
+        "a vision model instead. This flag will be removed in a future release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
 # =============================================================================
 # OCR Configuration
@@ -258,6 +277,24 @@ PDF_OCR_ENABLED = safe_bool(os.getenv("PDF_OCR_ENABLED"), False)
 
 IMAGE_GENERATE_CAPTIONS = safe_bool(os.getenv("IMAGE_GENERATE_CAPTIONS"), False)
 IMAGE_CAPTION_MODEL = os.getenv("IMAGE_CAPTION_MODEL", "blip-base")
+
+# =============================================================================
+# Vision-Language Model (VLM) Configuration
+# =============================================================================
+# The v0.14 vision pipeline describes/transcribes images (and OCRs image PDFs)
+# with a hosted multi-modal model via a provider-agnostic interface. A single
+# VLM call returns a description + transcribed text, which becomes the chunk's
+# text content for ordinary text embedding.
+
+# Which provider backs the VLM caller: "openai" or "anthropic". Normalized once
+# here (lower-cased) so a capitalized value like "OpenAI" can't slip past the
+# per-provider model default and pair the OpenAI client with the Claude model.
+VLM_PROVIDER = os.getenv("VLM_PROVIDER", "openai").strip().lower()
+# Default to vision-capable hosted models per provider.
+VLM_MODEL = os.getenv(
+    "VLM_MODEL", "gpt-4o" if VLM_PROVIDER == "openai" else "claude-3-5-sonnet-20241022"
+)
+VLM_MAX_TOKENS = safe_int(os.getenv("VLM_MAX_TOKENS"), 1024)
 
 # =============================================================================
 # Tool Behavior Configuration

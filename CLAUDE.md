@@ -210,14 +210,39 @@ All settings in `librarian/config.py` can be overridden via environment variable
 - `CODE_CONTEXT_LINES`: Lines of context around code
 
 ### Vision Processing (Optional)
-- `ENABLE_VISION_EMBEDDINGS`: Enable image embeddings
-- `VISION_EMBEDDING_MODEL`: CLIP model
-- `IMAGE_GENERATE_CAPTIONS`: Auto-generate image captions
+The v0.14 vision pipeline is **VLM-text only** (issue #53, strategy "Option C / Hybrid"):
+a hosted vision-language model describes/transcribes an image in one call, and that
+text is embedded in the ordinary TEXT space. CLIP image embeddings are retired.
+- `IMAGE_GENERATE_CAPTIONS`: Describe/transcribe images with a VLM (default off).
+  When off, images are indexed as metadata-only chunks tagged
+  `processing_status='uncaptioned'` (back-fillable later — see `libr reprocess`).
+- `VLM_PROVIDER`: `"openai"` (default) or `"anthropic"` (case-insensitive).
+- `VLM_MODEL`: Vision model id (default `gpt-4o` / `claude-3-5-sonnet-*` per provider).
+- `VLM_MAX_TOKENS`: Max tokens for the VLM response (default 1024).
+- `ENABLE_VISION_EMBEDDINGS`: **DEPRECATED / no-op.** Retired CLIP flag; setting it
+  emits a `DeprecationWarning` and changes nothing (the `vec_chunks_vision` table /
+  `EmbeddingModality.VISION` remain dormant for a possible v1.x re-introduction).
+- Requires the `vlm` extra: `uv pip install -e ".[vlm]"`.
 
 ### PDF Processing (Optional)
 - `ENABLE_PDF_PROCESSING`: Enable PDF parsing
-- `PDF_OCR_ENABLED`: Enable OCR for image-based PDFs
+- `PDF_OCR_ENABLED`: Enable OCR for image-based PDF pages (needs the `ocr` extra:
+  `pytesseract` + `pdf2image` + a system `tesseract`/`poppler`). When requested but
+  the deps are absent, PDFs still index their text and are tagged
+  `processing_status='ocr_unavailable'` for later retry.
 - `PDF_CHUNK_STRATEGY`: "pages" or "sections"
+
+### Reprocessing failed/uncaptioned chunks
+`libr reprocess --asset-type <type> --where <key>=<value>` re-ingests documents whose
+chunks carry a matching `modality_data` status (default `processing_status=failed`),
+updating content + status on success. Examples:
+- `libr reprocess` — retry images whose VLM caption failed.
+- `libr reprocess --where processing_status=uncaptioned` — back-fill captions after
+  enabling `IMAGE_GENERATE_CAPTIONS`.
+- `libr reprocess --asset-type pdf --where processing_status=ocr_unavailable` — retry
+  scanned PDFs after installing the OCR deps.
+`processing_status` values are the `ProcessingStatus` enum in `librarian/types.py`
+(`ok`, `failed`, `uncaptioned`, `ocr_unavailable`, `unsupported`).
 
 ### Search
 - `CHUNK_SIZE`, `CHUNK_OVERLAP`: Text chunking parameters

@@ -1392,7 +1392,7 @@ def search_cmd(
     ] = False,
     images: Annotated[
         bool,
-        typer.Option("--images", help="Search images only (uses vision embeddings if enabled)"),
+        typer.Option("--images", help="Search images only (matches VLM captions / OCR text)"),
     ] = False,
     asset_type: Annotated[
         Optional[str], typer.Option("--type", help="Filter by asset type: text, code, pdf, image")
@@ -1537,6 +1537,94 @@ def search_cmd(
             if len(result.get("content", "")) > 300:
                 content += "..."
             rprint(f"[dim]{i}.[/dim] {content}\n")
+
+
+@app.command("reprocess")
+def reprocess_cmd(
+    asset_type: Annotated[
+        str,
+        typer.Option("--asset-type", help="Asset type to reprocess (e.g. 'image', 'pdf')"),
+    ] = "image",
+    where: Annotated[
+        str,
+        typer.Option(
+            "--where",
+            help=(
+                "Match on the chunk's modality_data as key=value "
+                "(default: processing_status=failed)."
+            ),
+        ),
+    ] = "processing_status=failed",
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Show files being reprocessed")
+    ] = False,
+) -> None:
+    """Retry chunks whose processing failed.
+
+    Finds documents that own a chunk of ``--asset-type`` matching the ``--where``
+    status (e.g. images whose VLM caption failed) and re-ingests them, updating
+    each chunk's content and ``processing_status`` on success.
+    """
+    cfg = _get_config()
+    cfg["ensure_directories"]()
+    _guard_schema_or_exit()
+
+    from librarian.storage.factory import get_storage
+    from librarian.types import AssetType as LibAssetType
+
+    try:
+        lib_asset_type = LibAssetType(asset_type.lower())
+    except ValueError:
+        rprint(f"[red]Unknown asset type: {asset_type}[/red]")
+        raise typer.Exit(1) from None
+
+    if "=" not in where:
+        rprint("[red]--where must be key=value, e.g. processing_status=failed[/red]")
+        raise typer.Exit(1)
+    key, _, value = where.partition("=")
+    key, value = key.strip(), value.strip()
+
+    storage = get_storage()
+    try:
+        paths = storage.documents_to_reprocess(lib_asset_type, key, value)
+    except ValueError as e:
+        rprint(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if not paths:
+        rprint(f"[green]Nothing to reprocess[/green] (no {asset_type} chunks where {key}={value}).")
+        return
+
+    rprint(f"Reprocessing [bold]{len(paths)}[/bold] {asset_type} document(s)...")
+
+    # Build one Orchestrator (and its vision describer + provider client) up front
+    # and reuse it across every document, rather than reconstructing the whole
+    # stack per file as `_index_path` would.
+    from librarian.orchestrator import Orchestrator
+
+    orchestrator = Orchestrator(storage=storage)
+    reindexed = 0
+    errors = 0
+    for p in paths:
+        fp = Path(p)
+        if not fp.exists():
+            rprint(f"  [yellow]missing:[/yellow] {p}")
+            errors += 1
+            continue
+        try:
+            orchestrator.index_file(fp)
+            if verbose:
+                rprint(f"  [green]+[/green] {p}")
+            reindexed += 1
+        except Exception as e:
+            rprint(f"  [red]error:[/red] {p}: {e}")
+            errors += 1
+
+    remaining = storage.documents_to_reprocess(lib_asset_type, key, value)
+    rprint(
+        f"[green]Reprocessed {reindexed} document(s)[/green]; "
+        f"{len(remaining)} still {key}={value}; {errors} error(s)."
+    )
 
 
 # =============================================================================

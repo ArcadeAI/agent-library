@@ -178,7 +178,11 @@ class LocalFileConnector(Connector):
         """
         path = path.resolve()
         parser, asset_type = self._registry.get_parser(path)
-        if parser is None:
+        if parser is None and asset_type != AssetType.IMAGE:
+            # Images are the one binary asset we can still ingest without a
+            # parser instance: the VLM caption path reads raw bytes directly
+            # (so Pillow being absent doesn't block them). Everything else with
+            # no parser is genuinely unsupported -> skip.
             return None
 
         raw_content: str | None = None

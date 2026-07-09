@@ -18,7 +18,6 @@ import numpy as np
 from librarian.config import (
     ENABLE_CODE_EMBEDDINGS,
     ENABLE_CROSS_MODAL_SEARCH,
-    ENABLE_VISION_EMBEDDINGS,
     HYBRID_ALPHA,
     MMR_LAMBDA,
     MODALITY_WEIGHT_CODE,
@@ -224,13 +223,9 @@ class HybridSearcher:
             if code_results:
                 modality_results["code"] = code_results
 
-        # 3. VISION modality (if enabled)
-        if ENABLE_VISION_EMBEDDINGS:
-            vision_results = self.vector_search_by_modality(
-                query, EmbeddingModality.VISION, limit * 2, include_deleted=include_deleted
-            )
-            if vision_results:
-                modality_results["vision"] = vision_results
+        # (No VISION modality: v0.14 retired CLIP image embeddings (#53). Images
+        # embed in the TEXT space via their VLM caption / OCR text, so they are
+        # already covered by the TEXT + FTS results above.)
 
         # 4. FTS (keyword search)
         fts_results = self._fts_search(query, limit * 2, include_deleted=include_deleted)
@@ -587,17 +582,8 @@ class HybridSearcher:
                     "Failed to generate code query embedding, skipping CODE modality in MMR"
                 )
 
-        # Vision embedding (if enabled and dimension present)
-        if ENABLE_VISION_EMBEDDINGS:
-            try:
-                vision_embedder = get_embedder_for_modality(EmbeddingModality.VISION)
-                if vision_embedder:
-                    vision_embedding = np.array(vision_embedder.embed_query(query))
-                    query_embeddings[len(vision_embedding)] = vision_embedding
-            except Exception:
-                logger.debug(
-                    "Failed to generate vision query embedding, skipping VISION modality in MMR"
-                )
+        # (No VISION query embedding: image chunks embed in the TEXT space in
+        # v0.14 (#53), so they diversify against the text embedding above.)
 
         # Separate candidates with and without query embeddings
         modality_candidates: dict[int, list[tuple[SearchResult, np.ndarray]]] = {}

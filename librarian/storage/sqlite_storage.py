@@ -24,9 +24,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from librarian.storage._common import dumps_or_none as _dumps_or_none
 from librarian.storage._common import iso as _iso
 from librarian.storage._common import json_default as _json_default
 from librarian.storage._common import modality_table as _modality_table
+from librarian.storage._common import validate_json_key as _validate_json_key
 from librarian.storage.database import (
     Database,
     deserialize_embedding,
@@ -38,6 +40,7 @@ from librarian.storage.migrate import migrate as migrate_schema
 from librarian.storage.protocols import SyncState
 from librarian.storage.vector_store import VectorStore
 from librarian.storage.write_models import PreparedDocument
+from librarian.types import AssetType
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +213,31 @@ class SQLiteStorage:
             result[row["chunk_id"]] = (row["content"], embedding)
         return result
 
+    def documents_to_reprocess(
+        self, asset_type: AssetType, status_key: str, status_value: str
+    ) -> list[str]:
+        """Return distinct paths of live documents owning a matching chunk.
+
+        A document matches when it has a non-deleted chunk of ``asset_type``
+        whose ``modality_data[status_key]`` equals ``status_value`` -- e.g.
+        images whose VLM caption failed (``processing_status='failed'``). The
+        ``libr reprocess`` command re-ingests the returned paths.
+        """
+        key = _validate_json_key(status_key)
+        conn = self._db._get_connection()
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT d.path
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.asset_type = ?
+              AND c.deleted_at IS NULL
+              AND json_extract(c.modality_data, '$.{key}') = ?
+            """,  # noqa: S608 - key validated to a bare identifier
+            (asset_type.value, status_value),
+        ).fetchall()
+        return [row["path"] for row in rows]
+
     def write_upsert(self, conn: sqlite3.Connection, prepared: PreparedDocument) -> None:
         """Create-or-replace a document and all its chunks within ``conn``'s txn."""
         doc_pk = self._upsert_document_row(conn, prepared)
@@ -283,13 +311,15 @@ class SQLiteStorage:
         self, conn: sqlite3.Connection, doc_pk: int, prepared: PreparedDocument
     ) -> None:
         for chunk in prepared.chunks:
+            modality_data_json = _dumps_or_none(chunk.modality_data)
             cursor = conn.execute(
                 """
                 INSERT INTO chunks (
                     document_id, chunk_id, content, heading_path, chunk_index,
                     start_char, end_char, asset_type, modality, document_size,
-                    source_created_at, document_source_uri, chunk_source_uri
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_created_at, document_source_uri, chunk_source_uri,
+                    modality_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc_pk,
@@ -305,6 +335,7 @@ class SQLiteStorage:
                     _iso(prepared.source_created_at),
                     prepared.document_source_uri,
                     chunk.chunk_source_uri,
+                    modality_data_json,
                 ),
             )
             chunk_pk = cursor.lastrowid

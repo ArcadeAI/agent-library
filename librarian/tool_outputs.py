@@ -108,6 +108,9 @@ class SearchHit(TypedDict):
     # Only non-null hits appear when a search is run with include_deleted=True,
     # so an agent can tell "removed from source, kept for history" from current.
     deleted_at: str | None
+    # Type-specific metadata (e.g. ``{"processing_status": "failed"}`` for an
+    # image whose VLM caption errored). Present only when the chunk carries it.
+    modality_data: dict[str, Any] | None
 
 
 class ContextChunk(TypedDict):

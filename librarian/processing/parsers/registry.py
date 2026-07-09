@@ -122,15 +122,37 @@ class ParserRegistry:
         if extension in self._parsers:
             parser_class, asset_type = self._parsers[extension]
 
-            # Special handling for ImageParser to pass OCR config
-            # Re-evaluate environment variable to support dynamic configuration
+            # Special handling for ImageParser to pass OCR config.
+            # Re-evaluate environment variables to support dynamic configuration.
             if asset_type == AssetType.IMAGE:
                 import os
 
                 from librarian.config import safe_bool
 
                 enable_ocr = safe_bool(os.getenv("ENABLE_OCR"), False)
-                return parser_class(enable_ocr=enable_ocr), asset_type  # type: ignore[call-arg]
+                try:
+                    return parser_class(enable_ocr=enable_ocr), asset_type  # type: ignore[call-arg]
+                except ImportError:
+                    # Pillow not installed: the VLM caption path (which reads raw
+                    # bytes) can still handle the image, so preserve the asset
+                    # type and let the orchestrator decide.
+                    return None, AssetType.IMAGE
+
+            # PDFs: thread the PDF_OCR_ENABLED flag through so image-only pages
+            # get OCR'd. Re-read the env so tests/config changes take effect.
+            # PDFParser degrades to text-only (recording ``ocr_unavailable``) when
+            # OCR deps are missing rather than raising, so an ImportError here
+            # means pypdf itself is absent -> genuinely unsupported.
+            if asset_type == AssetType.PDF:
+                import os
+
+                from librarian.config import safe_bool
+
+                enable_ocr = safe_bool(os.getenv("PDF_OCR_ENABLED"), False)
+                try:
+                    return parser_class(enable_ocr=enable_ocr), asset_type  # type: ignore[call-arg]
+                except ImportError:
+                    return None, AssetType.PDF
 
             return parser_class(), asset_type
 

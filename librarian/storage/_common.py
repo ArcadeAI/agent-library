@@ -9,6 +9,8 @@ twins from drifting. (The genuinely dialect-specific SQL -- ``write_upsert`` /
 backend, since its body diverges.)
 """
 
+import json
+import re
 from collections.abc import Callable
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
@@ -21,11 +23,41 @@ if TYPE_CHECKING:
 __all__ = [
     "chunk_context_from_row",
     "deleted_filter",
+    "dumps_or_none",
     "iso",
     "json_default",
     "list_documents_query",
     "modality_table",
+    "validate_json_key",
 ]
+
+# A ``modality_data`` JSON key is interpolated directly into a JSON path
+# expression in both backends' reprocess queries (sqlite ``json_extract`` and
+# Postgres ``->>``), so restrict it to a bare identifier to keep it injection-safe.
+_JSON_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_json_key(key: str) -> str:
+    """Return ``key`` if it is a safe JSON object key, else raise ``ValueError``.
+
+    Used to guard keys that are interpolated into a JSON-path SQL expression
+    (they cannot be bound as parameters). Only plain identifiers are allowed.
+    """
+    if not _JSON_KEY_RE.match(key):
+        raise ValueError(
+            f"Invalid modality_data key {key!r}; expected a bare identifier "
+            "such as 'processing_status'."
+        )
+    return key
+
+
+def dumps_or_none(value: dict[str, Any] | None) -> str | None:
+    """Serialize a dict to JSON (with ``json_default`` fallback), or ``None``.
+
+    The single place both backends encode a chunk's ``modality_data`` column so
+    the twins can't drift on the empty/``None`` handling.
+    """
+    return json.dumps(value, default=json_default) if value else None
 
 
 def list_documents_query(

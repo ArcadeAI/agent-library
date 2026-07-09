@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from librarian.storage.fts_store import FTSSearchResult
     from librarian.storage.vector_store import VectorSearchResult
     from librarian.storage.write_models import PreparedDocument
-    from librarian.types import Document, EmbeddingModality
+    from librarian.types import AssetType, Document, EmbeddingModality
 
 __all__ = [
     "ChunkContext",
@@ -229,6 +229,10 @@ class Storage(Protocol):
     def soft_delete_document(
         self, conn: "TxnHandle", document_id: str, reason: str | None
     ) -> int: ...
+
+    def documents_to_reprocess(
+        self, asset_type: "AssetType", status_key: str, status_value: str
+    ) -> list[str]: ...
 
     def delete_document_by_path(self, path: str) -> bool:
         """Hard-delete a document (and its chunks/embeddings) by file path.

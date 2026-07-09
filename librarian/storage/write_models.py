@@ -32,6 +32,9 @@ class PreparedChunk:
     modality: EmbeddingModality = EmbeddingModality.TEXT
     embedding: list[float] | None = None
     model_version: str | None = None
+    # Type-specific metadata (e.g. VLM caption + ``processing_status``) persisted
+    # to the ``chunks.modality_data`` JSON column.
+    modality_data: dict[str, Any] | None = None
 
 
 @dataclass
