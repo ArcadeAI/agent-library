@@ -114,6 +114,17 @@ POSTGRES_CONNECT_TIMEOUT = safe_int(os.getenv("POSTGRES_CONNECT_TIMEOUT"), 10)
 POSTGRES_STATEMENT_TIMEOUT_MS = safe_int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS"), 30_000)
 POSTGRES_IDLE_TX_TIMEOUT_MS = safe_int(os.getenv("POSTGRES_IDLE_TX_TIMEOUT_MS"), 60_000)
 
+# Bounded connection pool (Postgres only). A threaded MCP/HTTP server checks
+# connections out of this pool instead of opening one per thread, so concurrent
+# request fan-out can't drift toward the server's ``max_connections``.
+# ``POSTGRES_POOL_MAX_SIZE`` caps live connections; ``POSTGRES_POOL_MIN_SIZE``
+# keeps a warm floor; ``POSTGRES_POOL_TIMEOUT`` bounds how long a checkout waits
+# for a free connection before raising (so an exhausted pool fails fast rather
+# than blocking forever).
+POSTGRES_POOL_MIN_SIZE = safe_int(os.getenv("POSTGRES_POOL_MIN_SIZE"), 1)
+POSTGRES_POOL_MAX_SIZE = safe_int(os.getenv("POSTGRES_POOL_MAX_SIZE"), 10)
+POSTGRES_POOL_TIMEOUT = safe_int(os.getenv("POSTGRES_POOL_TIMEOUT"), 30)
+
 # Text-search configuration (regconfig) used for the generated ``content_tsv``
 # column and the FTS query/headline functions. Pinned at table-creation time;
 # changing it on a populated database requires a schema rebuild.

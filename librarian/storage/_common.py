@@ -9,6 +9,7 @@ twins from drifting. (The genuinely dialect-specific SQL -- ``write_upsert`` /
 backend, since its body diverges.)
 """
 
+from collections.abc import Callable
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -22,8 +23,50 @@ __all__ = [
     "deleted_filter",
     "iso",
     "json_default",
+    "list_documents_query",
     "modality_table",
 ]
+
+
+def list_documents_query(
+    placeholder: str,
+    unbounded_limit: str,
+    format_date: Callable[[datetime], Any],
+    start_date: datetime | None,
+    end_date: datetime | None,
+    limit: int | None,
+    offset: int,
+) -> tuple[str, list[Any]]:
+    """Build the shared ``list_documents`` SQL + params for either substrate.
+
+    The one place the pagination query lives, so the two backends can't drift on
+    the ordering (``updated_at DESC, id DESC``) or the limit/offset semantics
+    that the ``MetadataStore`` protocol makes a cross-substrate contract. The
+    dialect differences are passed in: ``placeholder`` (``?`` vs ``%s``),
+    ``unbounded_limit`` (the ``LIMIT`` token meaning "no cap" -- ``-1`` on
+    SQLite, ``ALL`` on Postgres, used so ``offset`` works without a ``limit``),
+    and ``format_date`` (how a datetime is bound). ``placeholder`` and
+    ``unbounded_limit`` are fixed internal tokens, never user input.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if start_date:
+        clauses.append(f"updated_at >= {placeholder}")
+        params.append(format_date(start_date))
+    if end_date:
+        clauses.append(f"updated_at < {placeholder}")
+        params.append(format_date(end_date))
+    sql = "SELECT * FROM documents"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY updated_at DESC, id DESC"
+    if limit is not None:
+        sql += f" LIMIT {placeholder} OFFSET {placeholder}"
+        params.extend((limit, offset))
+    elif offset:
+        sql += f" LIMIT {unbounded_limit} OFFSET {placeholder}"
+        params.append(offset)
+    return sql, params
 
 
 def modality_table(modality: EmbeddingModality) -> str:

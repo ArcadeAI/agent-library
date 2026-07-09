@@ -14,8 +14,6 @@ or a cursor pointing past uncommitted content.
 
 import json
 import logging
-from collections.abc import Generator
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,7 +31,7 @@ from librarian.storage.postgres.fts_store import PgFTSStore
 from librarian.storage.postgres.migrate import migrate as migrate_schema
 from librarian.storage.postgres.vector_store import PgVectorStore
 from librarian.storage.protocols import SyncState
-from librarian.storage.write_models import PreparedDocument
+from librarian.storage.write_models import PreparedChunk, PreparedDocument
 
 logger = logging.getLogger(__name__)
 
@@ -64,35 +62,32 @@ class PostgresStorage:
 
     def migrate(self) -> None:
         """Create/upgrade the v0.14 Postgres schema (idempotent)."""
-        conn = self._db._get_connection()
-        migrate_schema(conn, schema=self._db.schema)
+        with self._db._connection() as conn:
+            migrate_schema(conn, schema=self._db.schema)
 
-    @contextmanager
-    def transaction(self) -> Generator[Any, None, None]:
-        """Yield the thread-local connection as one atomic transaction.
+    def transaction(self) -> Any:
+        """Run a single atomic transaction on one pooled connection.
 
-        Opens a real ``conn.transaction()`` block on the autocommit connection:
-        commits on clean exit, rolls back on exception. Reads issued inside this
-        block (e.g. ``get_sync_state``) run in the same transaction without
-        committing it, so content writes and cursor advances commit or roll back
+        Delegates to :meth:`PostgresDatabase.transaction`: content writes and
+        the reads/cursor advances issued inside the ``with`` block all join the
+        one checked-out connection's transaction, committing or rolling back
         together.
         """
-        conn = self._db._get_connection()
-        with conn.transaction():
-            yield conn
+        return self._db.transaction()
 
     # =========================================================================
     # StateStore
     # =========================================================================
 
     def get_sync_state(self, source_key: str) -> SyncState | None:
-        # Bare read on the (autocommit) thread-local connection: standalone it
-        # commits nothing; nested inside a ``transaction()`` block it joins that
-        # transaction without committing it (the atomicity guarantee).
-        conn = self._db._get_connection()
-        row = conn.execute(
-            "SELECT * FROM sync_state WHERE source_key = %s", (source_key,)
-        ).fetchone()
+        # Bare read on an autocommit connection: standalone it commits nothing;
+        # nested inside a ``transaction()`` block ``_connection()`` hands back
+        # that transaction's connection so the read joins it without committing
+        # it (the atomicity guarantee).
+        with self._db._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM sync_state WHERE source_key = %s", (source_key,)
+            ).fetchone()
         if row is None:
             return None
         cursor = row["cursor"]
@@ -113,9 +108,18 @@ class PostgresStorage:
         )
 
     def put_sync_state(self, state: SyncState, conn: Any = None) -> None:
-        """Upsert a sync-state row, joining ``conn``'s transaction when given."""
-        own = conn is None
-        conn = conn or self._db._get_connection()
+        """Upsert a sync-state row, joining ``conn``'s transaction when given.
+
+        With no ``conn`` the write runs on a pooled autocommit connection (so it
+        commits on its own); with ``conn`` it joins the caller's transaction.
+        """
+        if conn is not None:
+            self._exec_put_sync_state(conn, state)
+        else:
+            with self._db._connection() as own_conn:
+                self._exec_put_sync_state(own_conn, state)
+
+    def _exec_put_sync_state(self, conn: Any, state: SyncState) -> None:
         conn.execute(
             """
             INSERT INTO sync_state (
@@ -148,8 +152,6 @@ class PostgresStorage:
                 state.config_version,
             ),
         )
-        if own:
-            conn.commit()
 
     def get_file_mtime(self, source_key: str, path: str) -> float | None:
         """Return the last-recorded mtime for a single file, or ``None``.
@@ -157,11 +159,11 @@ class PostgresStorage:
         Bare read (see :meth:`get_sync_state`): safe to call inside a write
         ``transaction()`` without committing it.
         """
-        conn = self._db._get_connection()
-        row = conn.execute(
-            "SELECT mtime FROM source_file_state WHERE source_key = %s AND path = %s",
-            (source_key, path),
-        ).fetchone()
+        with self._db._connection() as conn:
+            row = conn.execute(
+                "SELECT mtime FROM source_file_state WHERE source_key = %s AND path = %s",
+                (source_key, path),
+            ).fetchone()
         return float(row["mtime"]) if row is not None else None
 
     def set_file_mtime(
@@ -172,8 +174,13 @@ class PostgresStorage:
         conn: Any = None,
     ) -> None:
         """Upsert one file's mtime, joining ``conn``'s transaction when given."""
-        own = conn is None
-        conn = conn or self._db._get_connection()
+        if conn is not None:
+            self._exec_set_file_mtime(conn, source_key, path, mtime)
+        else:
+            with self._db._connection() as own_conn:
+                self._exec_set_file_mtime(own_conn, source_key, path, mtime)
+
+    def _exec_set_file_mtime(self, conn: Any, source_key: str, path: str, mtime: float) -> None:
         conn.execute(
             """
             INSERT INTO source_file_state (source_key, path, mtime)
@@ -184,8 +191,6 @@ class PostgresStorage:
             """,
             (source_key, path, mtime),
         )
-        if own:
-            conn.commit()
 
     # =========================================================================
     # Write paths
@@ -202,18 +207,18 @@ class PostgresStorage:
         follows in the orchestrator -- no idle-in-transaction, nothing to block
         VACUUM.
         """
-        conn = self._db._get_connection()
-        rows = conn.execute(
-            """
-            SELECT c.chunk_id, c.content, ce.embedding AS embedding
-            FROM chunks c
-            LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.id
-            WHERE c.document_id = (SELECT id FROM documents WHERE document_id = %s)
-              AND c.deleted_at IS NULL
-              AND c.chunk_id IS NOT NULL
-            """,
-            (document_id,),
-        ).fetchall()
+        with self._db._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.chunk_id, c.content, ce.embedding AS embedding
+                FROM chunks c
+                LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+                WHERE c.document_id = (SELECT id FROM documents WHERE document_id = %s)
+                  AND c.deleted_at IS NULL
+                  AND c.chunk_id IS NOT NULL
+                """,
+                (document_id,),
+            ).fetchall()
         return {row["chunk_id"]: (row["content"], parse_vector(row["embedding"])) for row in rows}
 
     def write_upsert(self, conn: Any, prepared: PreparedDocument) -> None:
@@ -279,54 +284,102 @@ class PostgresStorage:
         ).fetchone()
         return int(row["id"])
 
+    # Multi-row INSERTs are bounded by Postgres's 65535 bind-parameter ceiling.
+    # The chunk insert binds 13 params/row, so cap each batch well under that;
+    # huge documents are written in a handful of round-trips instead of 2N.
+    _CHUNK_INSERT_BATCH = 1000
+
     def _replace_chunks(self, conn: Any, doc_pk: int, prepared: PreparedDocument) -> None:
-        # TODO(DEV-472): batch these writes. This issues 2N round-trips per
-        # document (one chunk INSERT...RETURNING + one embedding INSERT per
-        # chunk). In-process SQLite hides the cost, but on Postgres it dominates
-        # ingest latency for large documents -- switch to a multi-row
-        # INSERT...RETURNING (psycopg execute_values) + bulk embedding insert.
-        for chunk in prepared.chunks:
-            row = conn.execute(
-                """
-                INSERT INTO chunks (
-                    document_id, chunk_id, content, heading_path, chunk_index,
-                    start_char, end_char, asset_type, modality, document_size,
-                    source_created_at, document_source_uri, chunk_source_uri
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    doc_pk,
-                    chunk.chunk_id,
-                    chunk.content,
-                    chunk.heading_path,
-                    chunk.chunk_index,
-                    chunk.start_char,
-                    chunk.end_char,
-                    chunk.asset_type.value,
-                    chunk.modality.value,
-                    prepared.document_size,
-                    _iso(prepared.source_created_at),
-                    prepared.document_source_uri,
-                    chunk.chunk_source_uri,
-                ),
-            ).fetchone()
-            chunk_pk = row["id"]
-            if chunk.embedding:
-                table = _modality_table(chunk.modality)
-                literal = vector_literal(chunk.embedding)
-                if table == "chunk_embeddings":
-                    conn.execute(
-                        "INSERT INTO chunk_embeddings (chunk_id, embedding, model_version) "
-                        "VALUES (%s, %s::vector, %s)",
-                        (chunk_pk, literal, chunk.model_version),
-                    )
-                else:
-                    conn.execute(
-                        f"INSERT INTO {table} (chunk_id, embedding) "  # noqa: S608
-                        "VALUES (%s, %s::vector)",
-                        (chunk_pk, literal),
-                    )
+        """Insert all of a document's chunks + embeddings in bulk.
+
+        Per batch: one multi-row ``INSERT ... RETURNING`` for the chunks, then
+        one bulk insert per embedding table (down from the old 2N round-trips).
+        The chunk insert returns ``(id, chunk_index)`` so the new primary keys
+        can be matched back to each prepared chunk by its document-unique
+        ``chunk_index`` -- never relying on RETURNING preserving VALUES order,
+        which Postgres does not guarantee. Batched so a document with thousands
+        of chunks stays under the bind-parameter ceiling.
+        """
+        chunks = prepared.chunks
+        for start in range(0, len(chunks), self._CHUNK_INSERT_BATCH):
+            self._insert_chunk_batch(
+                conn, doc_pk, prepared, chunks[start : start + self._CHUNK_INSERT_BATCH]
+            )
+
+    def _insert_chunk_batch(
+        self, conn: Any, doc_pk: int, prepared: PreparedDocument, batch: list[PreparedChunk]
+    ) -> None:
+        if not batch:
+            return
+
+        chunk_columns = (
+            "document_id, chunk_id, content, heading_path, chunk_index, "
+            "start_char, end_char, asset_type, modality, document_size, "
+            "source_created_at, document_source_uri, chunk_source_uri"
+        )
+        source_created_at = _iso(prepared.source_created_at)
+        values_sql: list[str] = []
+        params: list[Any] = []
+        for chunk in batch:
+            values_sql.append("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            params.extend((
+                doc_pk,
+                chunk.chunk_id,
+                chunk.content,
+                chunk.heading_path,
+                chunk.chunk_index,
+                chunk.start_char,
+                chunk.end_char,
+                chunk.asset_type.value,
+                chunk.modality.value,
+                prepared.document_size,
+                source_created_at,
+                prepared.document_source_uri,
+                chunk.chunk_source_uri,
+            ))
+        rows = conn.execute(
+            f"INSERT INTO chunks ({chunk_columns}) VALUES {', '.join(values_sql)} "  # noqa: S608 - fixed column list + %s placeholders
+            "RETURNING id, chunk_index",
+            params,
+        ).fetchall()
+        pk_by_index = {row["chunk_index"]: row["id"] for row in rows}
+        # Re-pairing embeddings to PKs by chunk_index only works if chunk_index is
+        # unique within the batch; a preparer emitting duplicates would silently
+        # mispair embeddings. Fail loudly instead (no UNIQUE constraint enforces
+        # this at the schema level yet).
+        if len(pk_by_index) != len(batch):
+            raise ValueError(
+                "Duplicate chunk_index within one document; chunk_index must be "
+                "unique per document for embedding re-pairing to be correct."
+            )
+
+        # Group embedding rows by their destination table, then one bulk insert
+        # each. chunk_embeddings carries model_version; the code/vision tables do
+        # not, so they are batched separately.
+        text_rows: list[tuple[int, str, str | None]] = []
+        other_rows: dict[str, list[tuple[int, str]]] = {}
+        for chunk in batch:
+            if not chunk.embedding:
+                continue
+            chunk_pk = pk_by_index[chunk.chunk_index]
+            literal = vector_literal(chunk.embedding)
+            table = _modality_table(chunk.modality)
+            if table == "chunk_embeddings":
+                text_rows.append((chunk_pk, literal, chunk.model_version))
+            else:
+                other_rows.setdefault(table, []).append((chunk_pk, literal))
+
+        if text_rows:
+            placeholders = ", ".join("(%s, %s::vector, %s)" for _ in text_rows)
+            params = [field for row in text_rows for field in row]
+            cols = "chunk_id, embedding, model_version"
+            sql = f"INSERT INTO chunk_embeddings ({cols}) VALUES {placeholders}"  # noqa: S608 - placeholders are %s tuples only
+            conn.execute(sql, params)
+        for table, table_rows in other_rows.items():
+            placeholders = ", ".join("(%s, %s::vector)" for _ in table_rows)
+            params = [field for row in table_rows for field in row]
+            sql = f"INSERT INTO {table} (chunk_id, embedding) VALUES {placeholders}"  # noqa: S608 - table is a fixed internal literal
+            conn.execute(sql, params)
 
     def soft_delete_document(self, conn: Any, document_id: str, reason: str | None) -> int:
         """Tombstone all chunks of a document. Returns the number tombstoned."""
@@ -341,6 +394,19 @@ class PostgresStorage:
             (now, reason, document_id),
         )
         return int(cursor.rowcount)
+
+    def delete_document_by_path(self, path: str) -> bool:
+        """Hard-delete a document and its chunks/embeddings by path.
+
+        The admin removal path (``remove_from_library``). Chunks, embeddings and
+        the FTS ``content_tsv`` all hang off the document via ``ON DELETE
+        CASCADE`` (the tsvector is a generated column on ``chunks``), so a single
+        ``DELETE`` on ``documents`` removes everything. Runs on the autocommit
+        connection, so it commits on its own.
+        """
+        with self._db._connection() as conn:
+            cursor = conn.execute("DELETE FROM documents WHERE path = %s", (path,))
+            return int(cursor.rowcount) > 0
 
 
 _storage_instances: dict[tuple[str, str], PostgresStorage] = {}

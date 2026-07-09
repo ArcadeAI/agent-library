@@ -52,7 +52,6 @@ from librarian.sources.ignore import (
     normalize_force_include,
     should_skip_file,
 )
-from librarian.storage.database import get_database
 from librarian.storage.factory import get_metadata_store, get_storage
 from librarian.tool_outputs import (
     AddOutput,
@@ -490,7 +489,12 @@ async def add_to_library(
             ),
         )
 
-    dir_path = Path(directory) if directory else Path(DOCUMENTS_PATH)
+    # Resolve the directory (symlinks + normalization) so the file path we index
+    # matches what the local-file connector derives on a later re-index: both the
+    # success path (Orchestrator) and the no-embedding fallback below key their
+    # deterministic document_id off str(file_path), and a divergent spelling
+    # would insert a permanent stale duplicate instead of overwriting in place.
+    dir_path = (Path(directory) if directory else Path(DOCUMENTS_PATH)).resolve()
 
     try:
         dir_path.mkdir(parents=True, exist_ok=True)
@@ -576,24 +580,55 @@ async def add_to_library(
         logger.warning("Full indexing failed, storing without embeddings: %s", e)
 
         try:
-            db = get_database()
+            from librarian import ids
+            from librarian.connectors.local_file import SOURCE_TYPE, LocalFileConnector
             from librarian.processing.parsers.md import MarkdownParser
-            from librarian.types import Document
+            from librarian.storage.write_models import PreparedDocument
+            from librarian.types import AssetType
 
             parser = MarkdownParser()
             parsed = parser.parse_file(file_path)
             file_mtime = file_path.stat().st_mtime
 
-            doc = Document(
-                id=None,
-                path=str(file_path),
-                title=parsed.title,
-                content=parsed.content,
-                metadata=parsed.metadata,
-                file_mtime=file_mtime,
-            )
-            db.insert_document(doc)
+            storage = get_storage()
+            # Only write when nothing is indexed at this path yet. write_upsert
+            # replaces a document's chunks, so upserting a zero-chunk row over an
+            # already-indexed document (e.g. one whose file was removed out-of-band
+            # then re-added during an embedding outage) would wipe its live chunks
+            # and FTS rows. Leaving the existing index untouched keeps it
+            # searchable; a bare row is only worth writing for a brand-new file.
+            already_indexed = storage.metadata.get_document_by_path(str(file_path)) is not None
+            if not already_indexed:
+                # Store the document row (no chunks/embeddings) through the storage
+                # factory so the fallback honors STORAGE_BACKEND. The deterministic
+                # id + path reuse the local-file connector's identity (same name,
+                # source_type, and resolved path), so a later successful re-index
+                # overwrites in place rather than inserting a duplicate.
+                prepared = PreparedDocument(
+                    document_id=ids.document_id(
+                        LocalFileConnector.name, SOURCE_TYPE, str(file_path)
+                    ),
+                    path=str(file_path),
+                    title=parsed.title,
+                    content=parsed.content,
+                    metadata=parsed.metadata,
+                    asset_type=AssetType.TEXT,
+                    document_size=len(parsed.content),
+                    file_mtime=file_mtime,
+                    chunks=[],
+                )
+                with storage.transaction() as conn:
+                    storage.write_upsert(conn, prepared)
 
+            warning = (
+                "File saved but not indexed (embedding service unavailable). It "
+                "won't appear in search until re-indexed."
+                if not already_indexed
+                else (
+                    "File saved but not re-indexed (embedding service unavailable). "
+                    "Search still reflects the previously indexed version."
+                )
+            )
             return AddOutput(
                 status="stored_partial",
                 message=(
@@ -604,10 +639,7 @@ async def add_to_library(
                 title=parsed.title,
                 chunks=0,
                 indexed=False,
-                warning=(
-                    "File saved but not fully indexed. Keyword search will work, "
-                    "but semantic search won't find this content until re-indexed."
-                ),
+                warning=warning,
                 location=location_info,  # type: ignore[typeddict-item]
                 context={
                     "siblings": siblings,  # type: ignore[typeddict-item]
@@ -1166,9 +1198,9 @@ async def remove_from_library(
     By default, this only removes from the search index (the file
     remains on disk). Set delete_file=True to permanently delete.
     """
-    db = get_database()
-
-    deleted = db.delete_document_by_path(path)
+    # Route through the storage factory so removal honors STORAGE_BACKEND
+    # (a Postgres deployment must delete from Postgres, not a stray SQLite file).
+    deleted = get_storage().delete_document_by_path(path)
 
     result: RemoveOutput = {
         "path": path,
@@ -1233,7 +1265,12 @@ async def list_library_contents(
     and when it was added/updated.
     """
     db = get_metadata_store()
-    documents = db.list_documents()[:limit]
+    # Bound the read at the query (LIMIT) rather than slicing in Python, so the
+    # full content/metadata of every other document is never loaded. Clamp to a
+    # non-negative value: agents often pass -1 as a "no limit" convention, which
+    # would error on Postgres (LIMIT must not be negative) and return the whole
+    # corpus on SQLite; treat <= 0 as "no bound".
+    documents = db.list_documents(limit=limit if limit > 0 else None)
 
     return [
         DocumentSummary(

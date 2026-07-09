@@ -129,6 +129,13 @@ def migrate(conn: Any, schema: str = "public") -> None:
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_document_id ON documents(document_id)"
         )
+        # Supports list_documents' ``ORDER BY updated_at DESC, id DESC`` so a
+        # paginated read is an index-ordered scan of ``limit + offset`` rows
+        # rather than a full scan + sort of the (wide, content-bearing) table.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_updated_at_id "
+            "ON documents(updated_at DESC, id DESC)"
+        )
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS chunks (

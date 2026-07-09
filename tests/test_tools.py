@@ -135,6 +135,93 @@ class TestIngestionTools:
         assert (temp_docs_dir / "new_doc.md").exists()
 
     @pytest.mark.asyncio
+    async def test_add_to_library_no_embedding_fallback_uses_factory(
+        self, temp_docs_dir: Path, clean_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When indexing fails, the no-embedding fallback stores the document
+        through the storage factory (honoring STORAGE_BACKEND), not a direct
+        SQLite call. The document row is persisted and retrievable even though
+        no chunks/embeddings were written."""
+        import librarian.server as server
+        from librarian.storage.factory import get_metadata_store
+
+        def _boom(_file_path: Path) -> dict:
+            raise RuntimeError("embedding service unavailable")
+
+        monkeypatch.setattr(server, "_process_and_index_file", _boom)
+
+        result = await server.add_to_library(
+            context=CTX,
+            content="# Fallback Doc\n\nStored without embeddings.",
+            title="fallback_doc",
+            directory=str(temp_docs_dir),
+        )
+
+        assert result.get("status") == "stored_partial"
+        assert result.get("indexed") is False
+
+        # The document row landed through the factory and is retrievable.
+        file_path = temp_docs_dir / "fallback_doc.md"
+        doc = get_metadata_store().get_document_by_path(str(file_path))
+        assert doc is not None
+        assert "Stored without embeddings." in doc.content
+
+    @pytest.mark.asyncio
+    async def test_no_embedding_fallback_preserves_existing_index(
+        self, temp_docs_dir: Path, clean_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback must not wipe an already-indexed document's chunks.
+
+        If a file was indexed, then removed from disk out-of-band (its index rows
+        survive) and re-added during an embedding outage, the zero-chunk fallback
+        upsert would otherwise hard-delete the live chunks. The guard skips the
+        write when the path is already indexed, leaving search intact.
+        """
+        import librarian.server as server
+        from librarian.storage.factory import get_metadata_store, get_read_storage
+
+        # 1. Index a document normally (it gets chunks).
+        await server.add_to_library(
+            context=CTX,
+            content="# Kept Doc\n\nThis content stays searchable.",
+            title="kept_doc",
+            directory=str(temp_docs_dir),
+        )
+        file_path = temp_docs_dir / "kept_doc.md"
+        doc = get_metadata_store().get_document_by_path(str(file_path))
+        assert doc is not None
+
+        def _count_chunks() -> int:
+            with get_read_storage().database._connection() as conn:
+                return conn.execute(
+                    "SELECT COUNT(*) AS n FROM chunks WHERE document_id = ? AND deleted_at IS NULL",
+                    (doc.id,),
+                ).fetchone()["n"]
+
+        chunks_before = _count_chunks()
+        assert chunks_before > 0
+
+        # 2. File removed out-of-band (index rows remain), then re-added during
+        #    an embedding outage.
+        file_path.unlink()
+
+        def _boom(_file_path: Path) -> dict:
+            raise RuntimeError("embedding service unavailable")
+
+        monkeypatch.setattr(server, "_process_and_index_file", _boom)
+
+        result = await server.add_to_library(
+            context=CTX,
+            content="# Kept Doc\n\nThis content stays searchable.",
+            title="kept_doc",
+            directory=str(temp_docs_dir),
+        )
+
+        assert result.get("status") == "stored_partial"
+        # The pre-existing chunks survive -- the fallback left the index alone.
+        assert _count_chunks() == chunks_before
+
+    @pytest.mark.asyncio
     async def test_add_to_library_with_tags(self, temp_docs_dir: Path, clean_db: Path) -> None:
         """Test adding content to the library with tags."""
         from librarian.server import add_to_library
@@ -547,8 +634,15 @@ class TestDocumentManagementTools:
         file_path = temp_docs_dir / "test1.md"
         result = await remove_from_library(context=CTX, path=str(file_path), delete_file=True)
 
+        # Index removal routes through the storage factory (delete_document_by_path).
+        assert result.get("removed_from_index") is True
         assert result.get("file_deleted") is True
         assert not file_path.exists()
+
+        # The document is gone from the index: a second removal is a no-op.
+        from librarian.storage.factory import get_metadata_store
+
+        assert get_metadata_store().get_document_by_path(str(file_path)) is None
 
     @pytest.mark.asyncio
     async def test_list_library_contents(self, temp_docs_dir: Path, clean_db: Path) -> None:
@@ -563,6 +657,12 @@ class TestDocumentManagementTools:
         result = await list_library_contents(context=CTX, limit=100)
         assert isinstance(result, list)
         assert len(result) >= 2
+
+        # A negative limit (agents' "-1 = no limit" convention) must not reach
+        # SQL: it errors on Postgres and returns everything on SQLite. It's
+        # clamped to "no bound" and returns the full list without raising.
+        unbounded = await list_library_contents(context=CTX, limit=-1)
+        assert len(unbounded) == len(result)
 
     @pytest.mark.asyncio
     async def test_get_library_overview_stats(self, clean_db: Path) -> None:

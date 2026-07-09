@@ -338,6 +338,24 @@ class SQLiteStorage:
         )
         return cursor.rowcount
 
+    def delete_document_by_path(self, path: str) -> bool:
+        """Hard-delete a document and its chunks/embeddings by path.
+
+        The admin removal path (``remove_from_library``): drops the document row
+        plus every chunk, embedding, and FTS entry. FTS rows are cleaned by the
+        ``AFTER DELETE ON chunks`` trigger; vector rows by the explicit deletes
+        in :meth:`_delete_chunks_for_document`.
+        """
+        conn = self._db._get_connection()
+        row = conn.execute("SELECT id FROM documents WHERE path = ?", (path,)).fetchone()
+        if row is None:
+            return False
+        doc_pk = int(row["id"])
+        self._delete_chunks_for_document(conn, doc_pk)
+        conn.execute("DELETE FROM documents WHERE id = ?", (doc_pk,))
+        conn.commit()
+        return True
+
 
 _storage_instance: SQLiteStorage | None = None
 

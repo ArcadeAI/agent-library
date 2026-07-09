@@ -25,6 +25,7 @@ from librarian.config import (
     get_effective_embedding_dimension,
 )
 from librarian.storage._common import json_default as _json_default
+from librarian.storage._common import list_documents_query
 from librarian.storage.migrations import run_migrations
 from librarian.types import AssetType, Chunk, Document, EmbeddingModality
 
@@ -558,6 +559,8 @@ class Database:
         self,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[Document]:
         """
         List documents in the database, optionally filtered by date range.
@@ -565,41 +568,30 @@ class Database:
         Args:
             start_date: Optional start date for filtering (inclusive).
             end_date: Optional end date for filtering (exclusive).
+            limit: Optional cap on the number of rows returned. ``None`` (the
+                default) returns every match -- callers that only render a page
+                should pass a limit so the full ``content`` column isn't loaded
+                for the whole corpus.
+            offset: Number of leading rows to skip (for pagination).
 
         Returns:
-            List of documents matching the criteria.
+            List of documents matching the criteria, newest first. The
+            ``id`` tiebreak keeps the order (and therefore pagination) stable
+            when ``updated_at`` ties at the column's coarse resolution.
         """
+        # Shared builder (see _common.list_documents_query) so the ordering and
+        # limit/offset semantics stay identical to the Postgres backend.
+        sql, params = list_documents_query(
+            placeholder="?",
+            unbounded_limit="-1",
+            format_date=lambda d: d.isoformat(),
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
         with self._connection() as conn:
-            if start_date and end_date:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM documents
-                    WHERE updated_at >= ? AND updated_at < ?
-                    ORDER BY updated_at DESC
-                    """,
-                    (start_date.isoformat(), end_date.isoformat()),
-                ).fetchall()
-            elif start_date:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM documents
-                    WHERE updated_at >= ?
-                    ORDER BY updated_at DESC
-                    """,
-                    (start_date.isoformat(),),
-                ).fetchall()
-            elif end_date:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM documents
-                    WHERE updated_at < ?
-                    ORDER BY updated_at DESC
-                    """,
-                    (end_date.isoformat(),),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM documents ORDER BY updated_at DESC").fetchall()
-
+            rows = conn.execute(sql, params).fetchall()
             return [
                 Document(
                     id=row["id"],

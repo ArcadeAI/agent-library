@@ -101,6 +101,8 @@ class MetadataStore(Protocol):
         self,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> "list[Document]": ...
 
     def get_document_ids_in_timerange(
@@ -227,3 +229,14 @@ class Storage(Protocol):
     def soft_delete_document(
         self, conn: "TxnHandle", document_id: str, reason: str | None
     ) -> int: ...
+
+    def delete_document_by_path(self, path: str) -> bool:
+        """Hard-delete a document (and its chunks/embeddings) by file path.
+
+        The backend-agnostic admin removal path: routed through the storage
+        factory so it honors ``STORAGE_BACKEND`` instead of always hitting
+        SQLite. Returns ``True`` when a document was removed, ``False`` when no
+        document matched the path. Commits on its own (it is not part of an
+        orchestrator transaction).
+        """
+        ...
