@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from librarian.types import Document, EmbeddingModality
 
 __all__ = [
+    "ChunkContext",
     "FTSStore",
     "MetadataStore",
     "StateStore",
@@ -67,6 +68,27 @@ class SyncState:
     config_version: int = 0
 
 
+@dataclass
+class ChunkContext:
+    """One chunk in an :meth:`MetadataStore.get_chunk_context` window.
+
+    Carries both identity forms: the deterministic public ``chunk_id`` (TEXT,
+    what search returns) and the internal ``internal_id`` surrogate
+    (``chunks.id``). ``document_id`` is the internal ``documents.id``.
+    """
+
+    chunk_id: str | None
+    internal_id: int
+    document_id: int
+    document_path: str
+    content: str
+    heading_path: str | None
+    chunk_index: int
+    asset_type: str
+    chunk_source_uri: str | None
+    deleted_at: str | None = None
+
+
 @runtime_checkable
 class MetadataStore(Protocol):
     """Read access to document metadata."""
@@ -89,6 +111,16 @@ class MetadataStore(Protocol):
 
     def get_chunk_public_fields(self, chunk_ids: list[int]) -> dict[int, dict[str, Any]]: ...
 
+    def get_chunk_context(
+        self,
+        chunk_id: str,
+        before: int = 2,
+        after: int = 2,
+        include_deleted: bool = False,
+    ) -> list[ChunkContext]: ...
+
+    def chunk_exists(self, chunk_id: str) -> bool: ...
+
     def get_stats(self) -> dict[str, Any]: ...
 
 
@@ -106,6 +138,7 @@ class VectorStore(Protocol):
         query_embedding: list[float],
         limit: int = 10,
         min_similarity: float = 0.0,
+        include_deleted: bool = False,
     ) -> "list[VectorSearchResult]": ...
 
     def search_by_modality(
@@ -114,6 +147,7 @@ class VectorStore(Protocol):
         modality: "EmbeddingModality",
         limit: int = 10,
         min_similarity: float = 0.0,
+        include_deleted: bool = False,
     ) -> "list[VectorSearchResult]": ...
 
     def get_embedding(
@@ -132,6 +166,7 @@ class FTSStore(Protocol):
         query: str,
         limit: int = 10,
         snippet_length: int = 64,
+        include_deleted: bool = False,
     ) -> "list[FTSSearchResult]": ...
 
 

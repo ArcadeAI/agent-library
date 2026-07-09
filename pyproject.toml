@@ -147,11 +147,11 @@ forbidden_modules = [
     "librarian.storage.fts_store",
 ]
 ignore_imports = [
-    # Genuinely SQLite-only admin commands that have no backend-agnostic
-    # equivalent on the Storage protocol: `libr index clean/build` (clear_all),
-    # `libr index clobber` (unlink the .db file), and `libr sources rm` (hard
-    # delete loop). The server no longer needs this exception -- its removal and
-    # no-embedding fallback paths route through librarian.storage.factory and
+    # Genuinely SQLite-only admin commands with no backend-agnostic equivalent
+    # on the Storage protocol: `libr index clean/build` (clear_all) and
+    # `libr index clobber` (unlink the .db file). `libr sources rm` and the
+    # server's removal/no-embedding-fallback paths now route through
+    # librarian.storage.factory (delete_document_by_path / write_upsert) and
     # honor STORAGE_BACKEND. Normal app-facing read/write paths must go through
     # the factory.
     "librarian.cli -> librarian.storage.database",

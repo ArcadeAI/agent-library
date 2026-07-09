@@ -129,6 +129,13 @@ def migrate(conn: Any, schema: str = "public") -> None:
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_document_id ON documents(document_id)"
         )
+        # Supports list_documents' ``ORDER BY updated_at DESC, id DESC`` so a
+        # paginated read is an index-ordered scan of ``limit + offset`` rows
+        # rather than a full scan + sort of the (wide, content-bearing) table.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_updated_at_id "
+            "ON documents(updated_at DESC, id DESC)"
+        )
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS chunks (
@@ -158,18 +165,6 @@ def migrate(conn: Any, schema: str = "public") -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_deleted_at ON chunks(deleted_at)")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv ON chunks USING GIN(content_tsv)"
-        )
-
-        # Centralize the soft-delete predicate in one place. Every read site
-        # (vector search, FTS, existing_text_chunks) selects from ``chunks_live``
-        # instead of repeating ``WHERE deleted_at IS NULL`` -- so the live-row
-        # definition can't drift between query paths, and a forgotten filter
-        # can't silently resurrect tombstoned chunks in one search mode. A view
-        # (not RLS) keeps this declarative, dependency-free, and transparent to
-        # the planner, which inlines the predicate and still uses the underlying
-        # indexes. ``CREATE OR REPLACE`` keeps migrate() idempotent.
-        cur.execute(
-            "CREATE OR REPLACE VIEW chunks_live AS SELECT * FROM chunks WHERE deleted_at IS NULL"
         )
 
         cur.execute(

@@ -211,9 +211,10 @@ class PostgresStorage:
             rows = conn.execute(
                 """
                 SELECT c.chunk_id, c.content, ce.embedding AS embedding
-                FROM chunks_live c
+                FROM chunks c
                 LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.id
                 WHERE c.document_id = (SELECT id FROM documents WHERE document_id = %s)
+                  AND c.deleted_at IS NULL
                   AND c.chunk_id IS NOT NULL
                 """,
                 (document_id,),
@@ -342,6 +343,15 @@ class PostgresStorage:
             params,
         ).fetchall()
         pk_by_index = {row["chunk_index"]: row["id"] for row in rows}
+        # Re-pairing embeddings to PKs by chunk_index only works if chunk_index is
+        # unique within the batch; a preparer emitting duplicates would silently
+        # mispair embeddings. Fail loudly instead (no UNIQUE constraint enforces
+        # this at the schema level yet).
+        if len(pk_by_index) != len(batch):
+            raise ValueError(
+                "Duplicate chunk_index within one document; chunk_index must be "
+                "unique per document for embedding re-pairing to be correct."
+            )
 
         # Group embedding rows by their destination table, then one bulk insert
         # each. chunk_embeddings carries model_version; the code/vision tables do

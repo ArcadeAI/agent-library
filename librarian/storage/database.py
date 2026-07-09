@@ -14,7 +14,7 @@ import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlite_vec
 
@@ -25,8 +25,12 @@ from librarian.config import (
     get_effective_embedding_dimension,
 )
 from librarian.storage._common import json_default as _json_default
+from librarian.storage._common import list_documents_query
 from librarian.storage.migrations import run_migrations
 from librarian.types import AssetType, Chunk, Document, EmbeddingModality
+
+if TYPE_CHECKING:
+    from librarian.storage.protocols import ChunkContext
 
 logger = logging.getLogger(__name__)
 
@@ -406,10 +410,10 @@ class Database:
         """Fetch the public chunk fields for a set of internal chunk row ids.
 
         Returns a mapping of ``chunks.id`` -> ``{chunk_id, chunk_index,
-        document_size, source_created_at, chunk_source_uri}`` for every id that
-        exists; ids with no matching row are omitted. Lets the MCP layer enrich
-        search results with these columns given only the internal row ids the
-        retrieval pipeline returns.
+        document_size, source_created_at, chunk_source_uri, deleted_at}`` for
+        every id that exists; ids with no matching row are omitted. Lets the MCP
+        layer enrich search results with these columns given only the internal
+        row ids the retrieval pipeline returns.
         """
         if not chunk_ids:
             return {}
@@ -418,7 +422,7 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT id, chunk_id, chunk_index, document_size,
-                       source_created_at, chunk_source_uri
+                       source_created_at, chunk_source_uri, deleted_at
                 FROM chunks WHERE id IN ({placeholders})
                 """,  # noqa: S608 - placeholders are parameter markers
                 tuple(chunk_ids),
@@ -430,9 +434,86 @@ class Database:
                 "document_size": row["document_size"],
                 "source_created_at": row["source_created_at"],
                 "chunk_source_uri": row["chunk_source_uri"],
+                "deleted_at": row["deleted_at"],
             }
             for row in rows
         }
+
+    def get_chunk_context(
+        self,
+        chunk_id: str,
+        before: int = 2,
+        after: int = 2,
+        include_deleted: bool = False,
+    ) -> "list[ChunkContext]":
+        """Return the ``before`` chunks preceding and ``after`` following ``chunk_id``.
+
+        The anchor is located by its deterministic public ``chunk_id`` (TEXT).
+        Neighbors are the chunks in the same document whose ``chunk_index`` falls
+        in ``[anchor - before, anchor + after]`` excluding the anchor itself,
+        returned in source order. At most ``before + after`` rows come back
+        (fewer at document boundaries). Soft-deleted neighbors are excluded
+        unless ``include_deleted`` is set; the anchor lookup ignores deletion so
+        a tombstoned chunk can still be expanded.
+        """
+        from librarian.storage._common import chunk_context_from_row, deleted_filter
+
+        anchor = self._find_anchor_chunk(chunk_id)
+        if anchor is None:
+            return []
+        doc_pk, anchor_index = anchor
+
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.id AS internal_id,
+                    c.chunk_id AS chunk_id,
+                    c.document_id AS document_id,
+                    c.content AS content,
+                    c.heading_path AS heading_path,
+                    c.chunk_index AS chunk_index,
+                    c.asset_type AS asset_type,
+                    c.chunk_source_uri AS chunk_source_uri,
+                    c.deleted_at AS deleted_at,
+                    d.path AS document_path
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.document_id = ?
+                    AND c.chunk_index BETWEEN ? AND ?
+                    AND c.chunk_index != ?
+                    {deleted_filter(include_deleted)}
+                ORDER BY c.chunk_index ASC
+                """,  # noqa: S608 - deleted_filter returns a fixed internal literal
+                (doc_pk, anchor_index - before, anchor_index + after, anchor_index),
+            ).fetchall()
+
+        return [chunk_context_from_row(row) for row in rows]
+
+    def _find_anchor_chunk(self, chunk_id: str) -> tuple[int, int] | None:
+        """Resolve ``chunk_id`` to its ``(document_id, chunk_index)`` or ``None``.
+
+        Matches only the deterministic public ``chunk_id`` (TEXT). v0.14 write
+        paths always populate it, so there is no integer-surrogate fallback --
+        that would codify the unstable ``chunks.id`` as a public id form and, on
+        oversized/non-decimal input, raise instead of resolving to "not found".
+        """
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT document_id, chunk_index FROM chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["document_id"], row["chunk_index"]
+
+    def chunk_exists(self, chunk_id: str) -> bool:
+        """True if a chunk with this public ``chunk_id`` exists (deleted or not)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chunks WHERE chunk_id = ? LIMIT 1", (chunk_id,)
+            ).fetchone()
+        return row is not None
 
     def delete_document(self, doc_id: int) -> None:
         """
@@ -491,32 +572,24 @@ class Database:
                 default) returns every match -- callers that only render a page
                 should pass a limit so the full ``content`` column isn't loaded
                 for the whole corpus.
-            offset: Number of leading rows to skip (for pagination). Ignored
-                unless ``limit`` is set.
+            offset: Number of leading rows to skip (for pagination).
 
         Returns:
             List of documents matching the criteria, newest first. The
             ``id`` tiebreak keeps the order (and therefore pagination) stable
             when ``updated_at`` ties at the column's coarse resolution.
         """
-        # ``updated_at DESC, id DESC`` is the shared order both backends sort by,
-        # so a paginated read returns the same window regardless of substrate.
-        clauses: list[str] = []
-        params: list[Any] = []
-        if start_date:
-            clauses.append("updated_at >= ?")
-            params.append(start_date.isoformat())
-        if end_date:
-            clauses.append("updated_at < ?")
-            params.append(end_date.isoformat())
-        sql = "SELECT * FROM documents"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY updated_at DESC, id DESC"
-        if limit is not None:
-            sql += " LIMIT ? OFFSET ?"
-            params.extend((limit, offset))
-
+        # Shared builder (see _common.list_documents_query) so the ordering and
+        # limit/offset semantics stay identical to the Postgres backend.
+        sql, params = list_documents_query(
+            placeholder="?",
+            unbounded_limit="-1",
+            format_date=lambda d: d.isoformat(),
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
         with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [

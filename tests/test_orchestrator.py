@@ -303,6 +303,90 @@ async def test_soft_delete_hides_chunk_from_search(storage: SQLiteStorage) -> No
     assert storage.vectors.search(query_embedding) == []
 
 
+async def test_soft_delete_include_deleted_opt_in(storage: SQLiteStorage) -> None:
+    """The explicit opt-in surfaces tombstoned chunks the default hides.
+
+    Uses a fixture connector to emit a structural soft delete for a document
+    that is still present -- the case local files don't naturally exercise
+    (their deletes only fire when a file disappears from disk).
+    """
+    embedder = FakeEmbedder()
+    orch = Orchestrator(storage=storage, embedder=embedder)
+    await orch.sync(FakeConnector([_upsert("m1", "hello world")]))
+
+    query = embedder.embed_documents(["hello world"])[0]
+    await orch.sync(
+        FakeConnector([
+            DocumentSoftDelete(source_type="msg", source_native_id="m1", deletion_reason="gone")
+        ]),
+        source_key="fake-del",
+    )
+
+    # Hidden by default on both read paths.
+    assert storage.fts.search("hello") == []
+    assert storage.vectors.search(query) == []
+
+    # Returned when the caller explicitly opts in.
+    assert storage.fts.search("hello", include_deleted=True) != []
+    assert storage.vectors.search(query, include_deleted=True) != []
+
+
+async def test_expand_context_via_connector(storage: SQLiteStorage) -> None:
+    """End-to-end: a fragment's neighbors are recoverable after ingest."""
+    orch = Orchestrator(storage=storage, embedder=FakeEmbedder())
+    await orch.sync(
+        FakeConnector([_multi_upsert("thread", ["let's ship it", "yes, do it", "deploying now"])])
+    )
+
+    # Locate the fragmentary middle chunk by its public chunk_id.
+    conn = storage.database._get_connection()
+    anchor_id = conn.execute("SELECT chunk_id FROM chunks WHERE chunk_index = 1").fetchone()[0]
+
+    neighbors = storage.metadata.get_chunk_context(anchor_id, before=1, after=1)
+    assert [n.content for n in neighbors] == ["let's ship it", "deploying now"]
+
+
+async def test_local_file_connector_populates_v014_columns(
+    storage: SQLiteStorage, tmp_path: Path
+) -> None:
+    """A file ingested via LocalFileConnector carries every v0.14 chunk column.
+
+    Acceptance criterion: chunk_index, document_size, source_created_at and both
+    source URIs are populated end-to-end through the real connector + parser.
+    """
+    from librarian.connectors.local_file import LocalFileConnector
+
+    doc = tmp_path / "note.md"
+    doc.write_text("# Heading\n\n" + "Paragraph one. " * 40 + "\n\n" + "Paragraph two. " * 40)
+
+    orch = Orchestrator(storage=storage, embedder=FakeEmbedder())
+    await orch.sync(LocalFileConnector([tmp_path]))
+
+    conn = storage.database._get_connection()
+    rows = conn.execute(
+        """
+        SELECT chunk_index, document_size, source_created_at,
+               document_source_uri, chunk_source_uri
+        FROM chunks ORDER BY chunk_index
+        """
+    ).fetchall()
+
+    assert rows, "expected at least one chunk"
+    expected_uri = doc.resolve().as_uri()
+    expected_size = len((doc).read_text())
+    for i, row in enumerate(rows):
+        assert row["chunk_index"] == i
+        assert row["document_size"] is not None and row["document_size"] > 0
+        assert row["source_created_at"] is not None
+        assert row["document_source_uri"] == expected_uri
+        assert row["chunk_source_uri"] is not None
+        assert row["chunk_source_uri"].startswith(expected_uri)
+    # document_size reflects the parsed document content (not necessarily the raw
+    # byte count), so just assert it is recorded and positive above; the parsed
+    # markdown is comparable in size to the source.
+    assert rows[0]["document_size"] <= expected_size + 1024
+
+
 async def test_reingest_only_reembeds_changed_chunks(storage: SQLiteStorage) -> None:
     """Editing one chunk of a multi-chunk document re-embeds only that chunk."""
     embedder = CountingEmbedder()

@@ -55,6 +55,7 @@ from librarian.sources.ignore import (
 from librarian.storage.factory import get_metadata_store, get_storage
 from librarian.tool_outputs import (
     AddOutput,
+    ContextChunk,
     DocumentSummary,
     IndexDirectoryOutput,
     LibraryConfig,
@@ -488,7 +489,12 @@ async def add_to_library(
             ),
         )
 
-    dir_path = Path(directory) if directory else Path(DOCUMENTS_PATH)
+    # Resolve the directory (symlinks + normalization) so the file path we index
+    # matches what the local-file connector derives on a later re-index: both the
+    # success path (Orchestrator) and the no-embedding fallback below key their
+    # deterministic document_id off str(file_path), and a divergent spelling
+    # would insert a permanent stale duplicate instead of overwriting in place.
+    dir_path = (Path(directory) if directory else Path(DOCUMENTS_PATH)).resolve()
 
     try:
         dir_path.mkdir(parents=True, exist_ok=True)
@@ -575,6 +581,7 @@ async def add_to_library(
 
         try:
             from librarian import ids
+            from librarian.connectors.local_file import SOURCE_TYPE, LocalFileConnector
             from librarian.processing.parsers.md import MarkdownParser
             from librarian.storage.write_models import PreparedDocument
             from librarian.types import AssetType
@@ -583,25 +590,45 @@ async def add_to_library(
             parsed = parser.parse_file(file_path)
             file_mtime = file_path.stat().st_mtime
 
-            # Store the document row (no chunks/embeddings) through the storage
-            # factory so the fallback honors STORAGE_BACKEND instead of always
-            # writing to SQLite. The deterministic id + path match the local-file
-            # connector's, so a later successful re-index overwrites in place.
-            prepared = PreparedDocument(
-                document_id=ids.document_id("local_file", "file", str(file_path)),
-                path=str(file_path),
-                title=parsed.title,
-                content=parsed.content,
-                metadata=parsed.metadata,
-                asset_type=AssetType.TEXT,
-                document_size=len(parsed.content),
-                file_mtime=file_mtime,
-                chunks=[],
-            )
             storage = get_storage()
-            with storage.transaction() as conn:
-                storage.write_upsert(conn, prepared)
+            # Only write when nothing is indexed at this path yet. write_upsert
+            # replaces a document's chunks, so upserting a zero-chunk row over an
+            # already-indexed document (e.g. one whose file was removed out-of-band
+            # then re-added during an embedding outage) would wipe its live chunks
+            # and FTS rows. Leaving the existing index untouched keeps it
+            # searchable; a bare row is only worth writing for a brand-new file.
+            already_indexed = storage.metadata.get_document_by_path(str(file_path)) is not None
+            if not already_indexed:
+                # Store the document row (no chunks/embeddings) through the storage
+                # factory so the fallback honors STORAGE_BACKEND. The deterministic
+                # id + path reuse the local-file connector's identity (same name,
+                # source_type, and resolved path), so a later successful re-index
+                # overwrites in place rather than inserting a duplicate.
+                prepared = PreparedDocument(
+                    document_id=ids.document_id(
+                        LocalFileConnector.name, SOURCE_TYPE, str(file_path)
+                    ),
+                    path=str(file_path),
+                    title=parsed.title,
+                    content=parsed.content,
+                    metadata=parsed.metadata,
+                    asset_type=AssetType.TEXT,
+                    document_size=len(parsed.content),
+                    file_mtime=file_mtime,
+                    chunks=[],
+                )
+                with storage.transaction() as conn:
+                    storage.write_upsert(conn, prepared)
 
+            warning = (
+                "File saved but not indexed (embedding service unavailable). It "
+                "won't appear in search until re-indexed."
+                if not already_indexed
+                else (
+                    "File saved but not re-indexed (embedding service unavailable). "
+                    "Search still reflects the previously indexed version."
+                )
+            )
             return AddOutput(
                 status="stored_partial",
                 message=(
@@ -612,10 +639,7 @@ async def add_to_library(
                 title=parsed.title,
                 chunks=0,
                 indexed=False,
-                warning=(
-                    "File saved but not fully indexed. Keyword search will work, "
-                    "but semantic search won't find this content until re-indexed."
-                ),
+                warning=warning,
                 location=location_info,  # type: ignore[typeddict-item]
                 context={
                     "siblings": siblings,  # type: ignore[typeddict-item]
@@ -748,6 +772,11 @@ async def search_library(
         "End date for custom range (YYYY-MM-DD). Use with start_date.",
     ] = None,
     limit: Annotated[int, "Maximum number of results to return"] = 10,
+    include_deleted: Annotated[
+        bool,
+        "Include soft-deleted (tombstoned) chunks in results. Off by default; "
+        "turn on to surface content removed from its source but kept for history.",
+    ] = False,
 ) -> Annotated[
     list[SearchHit],
     "Ranked list of matching chunks with score, snippet, and asset type.",
@@ -781,6 +810,8 @@ async def search_library(
         mode = SearchMode.HYBRID
     if limit is None:
         limit = 10
+    if include_deleted is None:
+        include_deleted = False
 
     db = get_metadata_store()
     filter_doc_ids: list[int] | None = None
@@ -844,19 +875,21 @@ async def search_library(
             # Use modality-specific embeddings when available
             if asset_type == AssetType.CODE and ENABLE_CODE_EMBEDDINGS:
                 results = searcher.vector_search_by_modality(
-                    query, EmbeddingModality.CODE, limit=limit
+                    query, EmbeddingModality.CODE, limit=limit, include_deleted=include_deleted
                 )
             elif asset_type == AssetType.IMAGE and ENABLE_VISION_EMBEDDINGS:
                 results = searcher.vector_search_by_modality(
-                    query, EmbeddingModality.VISION, limit=limit
+                    query, EmbeddingModality.VISION, limit=limit, include_deleted=include_deleted
                 )
             else:
-                results = searcher.vector_search(query, limit=limit)
+                results = searcher.vector_search(
+                    query, limit=limit, include_deleted=include_deleted
+                )
                 # Filter by asset type if specified (vector_search doesn't support it natively)
                 if asset_type_filter:
                     results = [r for r in results if r.asset_type in asset_type_filter][:limit]
         elif mode == SearchMode.KEYWORD:
-            results = searcher.keyword_search(query, limit=limit)
+            results = searcher.keyword_search(query, limit=limit, include_deleted=include_deleted)
             # Filter by asset type if specified
             if asset_type_filter:
                 results = [r for r in results if r.asset_type in asset_type_filter][:limit]
@@ -868,6 +901,7 @@ async def search_library(
                 use_mmr=True,
                 filter_document_ids=filter_doc_ids,
                 asset_types=asset_type_filter,
+                include_deleted=include_deleted,
             )
     except Exception as e:
         logger.exception("search_library failed (mode=%s)", mode.value)
@@ -910,9 +944,148 @@ async def search_library(
                 chunk_index=extra.get("chunk_index"),
                 document_size=extra.get("document_size"),
                 source_created_at=extra.get("source_created_at"),
+                deleted_at=extra.get("deleted_at"),
             )
         )
     return hits
+
+
+# Upper bound on each side of an expand_context window. Guards against a caller
+# asking for the whole document (thousands of chunks, full content each) in one
+# MCP response; mirrors the negative-value clamp on the same params.
+_EXPAND_CONTEXT_MAX = 50
+
+
+def _clamp_window(value: int | None, default: int = 2) -> int:
+    """Coerce a window size to ``[0, _EXPAND_CONTEXT_MAX]`` (None/negative -> default)."""
+    if value is None or value < 0:
+        return default
+    return min(value, _EXPAND_CONTEXT_MAX)
+
+
+@app.tool(  # type: ignore[arg-type]
+    metadata=ToolMetadata(
+        behavior=Behavior(
+            operations=[Operation.READ],
+            read_only=True,
+            destructive=False,
+            idempotent=True,
+            open_world=False,
+        ),
+    ),
+)
+async def expand_context(
+    context: Context,
+    chunk_id: Annotated[
+        str,
+        "The chunk_id to expand around (the value returned by search_library).",
+    ],
+    before: Annotated[int, "Number of chunks to retrieve before the given chunk"] = 2,
+    after: Annotated[int, "Number of chunks to retrieve after the given chunk"] = 2,
+    include_deleted: Annotated[
+        bool,
+        "Include soft-deleted neighbor chunks. Off by default.",
+    ] = False,
+) -> Annotated[
+    list[ContextChunk],
+    "Neighboring chunks from the same document, in source order.",
+]:
+    """
+    Retrieve the chunks surrounding a search hit, in source order.
+
+    Search returns isolated chunks, so a fragmentary match (e.g. a reply that
+    just says "yes, do it") can be hard to interpret on its own. Call this with
+    that chunk's `chunk_id` to pull its neighbors from the same document and
+    reconstruct the surrounding context.
+
+    Returns up to `before + after` chunks (fewer near document boundaries, and
+    at most 50 per side), ordered by their position in the document. The anchor
+    chunk itself is not repeated — you already have it from search.
+    """
+    before = _clamp_window(before)
+    after = _clamp_window(after)
+    if include_deleted is None:
+        include_deleted = False
+
+    anchor_id = str(chunk_id).strip() if chunk_id else ""
+    if not anchor_id:
+        raise RetryableToolError(
+            message="expand_context needs a chunk_id.",
+            additional_prompt_content=(
+                "Pass the `chunk_id` from a search_library result. Run "
+                "search_library first, then call expand_context with the "
+                "chunk_id of the hit you want more context around."
+            ),
+        )
+
+    db = get_metadata_store()
+    try:
+        neighbors = db.get_chunk_context(
+            anchor_id, before=before, after=after, include_deleted=include_deleted
+        )
+    except Exception as e:
+        # Backend unreachable, or a serve-only process pointed at a database the
+        # v0.14 write path never migrated (no chunks.chunk_id column yet).
+        # Degrade like search_library instead of dead-ending on a non-retryable
+        # error the agent can't act on.
+        logger.exception("expand_context failed (chunk_id=%s)", chunk_id)
+        raise RetryableToolError(
+            message="Couldn't expand context right now.",
+            additional_prompt_content=(
+                "The library index may be empty or not built yet. Add content "
+                "with index_directory_to_library first, then retry. To confirm "
+                "the index exists, call get_library_overview(view='stats')."
+            ),
+        ) from e
+
+    if neighbors:
+        return [
+            ContextChunk(
+                chunk_id=n.chunk_id or str(n.internal_id),
+                document_id=n.document_id,
+                document_path=n.document_path,
+                content=n.content,
+                heading_path=n.heading_path,
+                chunk_index=n.chunk_index,
+                asset_type=n.asset_type,
+                chunk_source_uri=n.chunk_source_uri,
+                deleted_at=n.deleted_at,
+            )
+            for n in neighbors
+        ]
+
+    # Empty window: three distinct causes, each needs different guidance. The
+    # anchor lookup ignores deletion, so an existing-but-tombstoned anchor gets
+    # here with default include_deleted=False.
+    if not include_deleted:
+        # A soft delete tombstones every chunk of a document at once, so an agent
+        # that found this anchor via include_deleted=True and dropped the flag
+        # lands exactly here — steer it to the one thing that would work.
+        tombstoned = db.get_chunk_context(
+            anchor_id, before=before, after=after, include_deleted=True
+        )
+        if tombstoned:
+            raise RetryableToolError(
+                message=f"The neighbors of chunk_id={chunk_id!r} are soft-deleted.",
+                additional_prompt_content=(
+                    "Call expand_context again with include_deleted=True to include "
+                    "tombstoned chunks (content removed from its source but kept "
+                    "for history)."
+                ),
+            )
+
+    if not db.chunk_exists(anchor_id):
+        raise RetryableToolError(
+            message=f"No chunk found for chunk_id={chunk_id!r}.",
+            additional_prompt_content=(
+                "Double-check the chunk_id came from a recent search_library "
+                "result — expand_context takes the `chunk_id` field of a hit."
+            ),
+        )
+
+    # The anchor exists but stands alone (single-chunk document): an empty list
+    # is the honest answer, matching search_library's empty-result convention.
+    return []
 
 
 # =============================================================================
@@ -1093,8 +1266,11 @@ async def list_library_contents(
     """
     db = get_metadata_store()
     # Bound the read at the query (LIMIT) rather than slicing in Python, so the
-    # full content/metadata of every other document is never loaded.
-    documents = db.list_documents(limit=limit)
+    # full content/metadata of every other document is never loaded. Clamp to a
+    # non-negative value: agents often pass -1 as a "no limit" convention, which
+    # would error on Postgres (LIMIT must not be negative) and return the whole
+    # corpus on SQLite; treat <= 0 as "no bound".
+    documents = db.list_documents(limit=limit if limit > 0 else None)
 
     return [
         DocumentSummary(

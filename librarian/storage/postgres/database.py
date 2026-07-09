@@ -37,7 +37,7 @@ import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from librarian.config import (
     POSTGRES_CONNECT_TIMEOUT,
@@ -49,7 +49,11 @@ from librarian.config import (
     POSTGRES_SCHEMA,
     POSTGRES_STATEMENT_TIMEOUT_MS,
 )
+from librarian.storage._common import list_documents_query
 from librarian.types import AssetType, Document
+
+if TYPE_CHECKING:
+    from librarian.storage.protocols import ChunkContext
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +131,10 @@ class PostgresDatabase:
         # reads issued inside that block join the same transaction instead of
         # borrowing a second connection from the pool.
         self._pool: Any = None
+        # Guards lazy pool creation: without it, threads racing the first
+        # checkout (the exact MCP/HTTP fan-out this pool exists for) could each
+        # build a ConnectionPool and leak all but the last.
+        self._pool_lock = threading.Lock()
         self._local = threading.local()
 
     # =========================================================================
@@ -159,27 +167,38 @@ class PostgresDatabase:
             )
 
     def _get_pool(self) -> Any:
-        """Get or lazily create the bounded connection pool."""
-        if self._pool is not None and not self._pool.closed:
+        """Get or lazily create the bounded connection pool (thread-safe)."""
+        pool = self._pool
+        if pool is not None and not pool.closed:
+            return pool
+
+        with self._pool_lock:
+            # Double-check inside the lock: another thread may have built it
+            # while we waited.
+            if self._pool is not None and not self._pool.closed:
+                return self._pool
+
+            psycopg_pool = _require_psycopg_pool()
+            from psycopg.rows import dict_row
+
+            connect_kwargs: dict[str, Any] = {"autocommit": True, "row_factory": dict_row}
+            if POSTGRES_CONNECT_TIMEOUT > 0:
+                connect_kwargs["connect_timeout"] = POSTGRES_CONNECT_TIMEOUT
+
+            # Note: a bad DSN/credential no longer fails on the first bare read
+            # with the driver's OperationalError -- a checkout now waits up to
+            # POSTGRES_POOL_TIMEOUT and raises psycopg_pool.PoolTimeout, with the
+            # underlying connection error in the pool's worker logs.
+            self._pool = psycopg_pool.ConnectionPool(
+                self.dsn,
+                min_size=POSTGRES_POOL_MIN_SIZE,
+                max_size=POSTGRES_POOL_MAX_SIZE,
+                timeout=POSTGRES_POOL_TIMEOUT,
+                kwargs=connect_kwargs,
+                configure=self._configure_connection,
+                open=True,
+            )
             return self._pool
-
-        psycopg_pool = _require_psycopg_pool()
-        from psycopg.rows import dict_row
-
-        connect_kwargs: dict[str, Any] = {"autocommit": True, "row_factory": dict_row}
-        if POSTGRES_CONNECT_TIMEOUT > 0:
-            connect_kwargs["connect_timeout"] = POSTGRES_CONNECT_TIMEOUT
-
-        self._pool = psycopg_pool.ConnectionPool(
-            self.dsn,
-            min_size=POSTGRES_POOL_MIN_SIZE,
-            max_size=POSTGRES_POOL_MAX_SIZE,
-            timeout=POSTGRES_POOL_TIMEOUT,
-            kwargs=connect_kwargs,
-            configure=self._configure_connection,
-            open=True,
-        )
-        return self._pool
 
     @contextmanager
     def _connection(self) -> Generator[Any, None, None]:
@@ -212,7 +231,20 @@ class PostgresDatabase:
         block (e.g. ``get_sync_state``, ``write_upsert``) all run in this one
         transaction and commit or roll back together. The pool reclaims the
         connection when the block exits.
+
+        Not re-entrant: a nested ``transaction()`` would check out a second
+        connection (self-deadlock risk, guaranteed ``PoolTimeout`` at
+        ``max_size=1``) and, worse, its ``finally`` would unpark the connection
+        so the outer block's remaining writes silently commit independently --
+        breaking the content+cursor atomicity guarantee with no error. We raise
+        instead. (No current caller nests; this keeps a future one honest.)
         """
+        if getattr(self._local, "txn_conn", None) is not None:
+            raise RuntimeError(
+                "PostgresDatabase.transaction() is not re-entrant: a transaction "
+                "is already open on this thread. Pass the existing connection to "
+                "the write methods instead of opening a nested transaction."
+            )
         with self._get_pool().connection() as conn:
             self._local.txn_conn = conn
             try:
@@ -264,26 +296,21 @@ class PostgresDatabase:
     ) -> list[Document]:
         """List documents newest-first, optionally windowed and paginated.
 
-        Mirrors :meth:`librarian.storage.database.Database.list_documents`: the
-        same ``updated_at DESC, id DESC`` order and ``limit``/``offset`` bounds,
-        so a paginated read returns the same window on either substrate.
+        Mirrors :meth:`librarian.storage.database.Database.list_documents` via
+        the shared :func:`~librarian.storage._common.list_documents_query`
+        builder: the same ``updated_at DESC, id DESC`` order and ``limit`` /
+        ``offset`` bounds, so a paginated read returns the same window on either
+        substrate. Postgres binds datetimes directly (no isoformat).
         """
-        clauses: list[str] = []
-        params: list[Any] = []
-        if start_date:
-            clauses.append("updated_at >= %s")
-            params.append(start_date)
-        if end_date:
-            clauses.append("updated_at < %s")
-            params.append(end_date)
-        sql = "SELECT * FROM documents"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY updated_at DESC, id DESC"
-        if limit is not None:
-            sql += " LIMIT %s OFFSET %s"
-            params.extend((limit, offset))
-
+        sql, params = list_documents_query(
+            placeholder="%s",
+            unbounded_limit="ALL",
+            format_date=lambda d: d,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
         with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [self._row_to_document(row) for row in rows]
@@ -313,7 +340,7 @@ class PostgresDatabase:
             rows = conn.execute(
                 """
                 SELECT id, chunk_id, chunk_index, document_size,
-                       source_created_at, chunk_source_uri
+                       source_created_at, chunk_source_uri, deleted_at
                 FROM chunks WHERE id = ANY(%s)
                 """,
                 (list(chunk_ids),),
@@ -325,9 +352,84 @@ class PostgresDatabase:
                 "document_size": row["document_size"],
                 "source_created_at": row["source_created_at"],
                 "chunk_source_uri": row["chunk_source_uri"],
+                "deleted_at": row["deleted_at"],
             }
             for row in rows
         }
+
+    def get_chunk_context(
+        self,
+        chunk_id: str,
+        before: int = 2,
+        after: int = 2,
+        include_deleted: bool = False,
+    ) -> "list[ChunkContext]":
+        """Postgres parity for :meth:`Database.get_chunk_context`.
+
+        Same window semantics as the SQLite backend: locate the anchor by public
+        ``chunk_id`` (TEXT), then return the chunks in
+        ``[anchor - before, anchor + after]`` excluding the anchor, in source
+        order. Soft-deleted neighbors are included only when ``include_deleted``
+        is set.
+        """
+        from librarian.storage._common import chunk_context_from_row, deleted_filter
+
+        anchor = self._find_anchor_chunk(chunk_id)
+        if anchor is None:
+            return []
+        doc_pk, anchor_index = anchor
+
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    c.id AS internal_id,
+                    c.chunk_id AS chunk_id,
+                    c.document_id AS document_id,
+                    c.content AS content,
+                    c.heading_path AS heading_path,
+                    c.chunk_index AS chunk_index,
+                    c.asset_type AS asset_type,
+                    c.chunk_source_uri AS chunk_source_uri,
+                    c.deleted_at AS deleted_at,
+                    d.path AS document_path
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.document_id = %s
+                    AND c.chunk_index BETWEEN %s AND %s
+                    AND c.chunk_index != %s
+                    {deleted_filter(include_deleted)}
+                ORDER BY c.chunk_index ASC
+                """,  # noqa: S608 - deleted_filter returns a fixed internal literal
+                (doc_pk, anchor_index - before, anchor_index + after, anchor_index),
+            ).fetchall()
+
+        return [chunk_context_from_row(row) for row in rows]
+
+    def _find_anchor_chunk(self, chunk_id: str) -> tuple[int, int] | None:
+        """Resolve ``chunk_id`` to its ``(document_id, chunk_index)`` or ``None``.
+
+        Matches only the deterministic public ``chunk_id`` (TEXT). Postgres is a
+        v0.14-only substrate, so legacy NULL-``chunk_id`` rows can't exist by
+        construction -- there is no integer-surrogate fallback to diverge from
+        SQLite over.
+        """
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT document_id, chunk_index FROM chunks WHERE chunk_id = %s",
+                (chunk_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["document_id"], row["chunk_index"]
+
+    def chunk_exists(self, chunk_id: str) -> bool:
+        """True if a chunk with this public ``chunk_id`` exists (deleted or not)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chunks WHERE chunk_id = %s LIMIT 1", (chunk_id,)
+            ).fetchone()
+        return row is not None
 
     def get_stats(self) -> dict[str, Any]:
         with self._connection() as conn:

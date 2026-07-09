@@ -12,6 +12,7 @@ query, giving forgiving plain-language matching without FTS5-specific escaping.
 import logging
 
 from librarian.config import POSTGRES_FTS_LANGUAGE
+from librarian.storage._common import deleted_filter
 from librarian.storage.fts_store import FTSSearchResult
 from librarian.storage.postgres.database import PostgresDatabase
 
@@ -31,6 +32,7 @@ class PgFTSStore:
         query: str,
         limit: int = 10,
         snippet_length: int = 64,
+        include_deleted: bool = False,
     ) -> list[FTSSearchResult]:
         if not query.strip():
             return []
@@ -57,13 +59,14 @@ class PgFTSStore:
                     d.path AS document_path,
                     d.asset_type AS asset_type,
                     ts_headline(%s::regconfig, c.content, q.query, '{headline_opts}') AS snippet
-                FROM chunks_live c
+                FROM chunks c
                 JOIN documents d ON c.document_id = d.id
                 CROSS JOIN q
                 WHERE c.content_tsv @@ q.query
+                  {deleted_filter(include_deleted)}
                 ORDER BY rank DESC
                 LIMIT %s
-                """,  # noqa: S608 - headline_opts is built from a validated int
+                """,  # noqa: S608 - headline_opts/deleted_filter are fixed internal literals
                 (lang, query, lang, limit),
             ).fetchall()
 
