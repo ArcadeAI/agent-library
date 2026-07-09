@@ -1,5 +1,6 @@
 """Tests for CLI behavior."""
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from librarian import cli
+from tests.test_health import _prepared_doc, _storage, _write
 
 LONG_WINDOWS_PATH = (
     r"C:\Users\example\Documents\Codex\2026-05-16"
@@ -279,6 +281,105 @@ def test_search_timeframe_uses_configured_metadata_store(
 
     assert result.exit_code == 0, result.output
     assert result.output == "/postgres/doc.md\n"
+
+
+def test_health_json_outputs_machine_readable(
+    clean_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = _storage(clean_db)
+    _write(storage, _prepared_doc(tmp_path / "health.md", document_id="cli-health-json"))
+    monkeypatch.setattr(cli, "SOURCES_FILE", tmp_path / "sources.json")
+
+    result = CliRunner().invoke(cli.app, ["health", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["document_count"] == 1
+    assert payload["chunk_count"] == 1
+    assert payload["embedding_count"] == 1
+    assert isinstance(payload["issues"], list)
+
+
+def test_health_table_outputs_summary_sections(
+    clean_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = _storage(clean_db)
+    _write(storage, _prepared_doc(tmp_path / "health.md", document_id="cli-health-table"))
+    monkeypatch.setattr(cli, "SOURCES_FILE", tmp_path / "sources.json")
+    monkeypatch.setattr(cli, "console", Console(width=120, color_system=None))
+
+    result = CliRunner().invoke(cli.app, ["health"])
+
+    assert result.exit_code == 0, result.output
+    assert "Library Health" in result.output
+    assert "Asset Distribution" in result.output
+    assert "Embedding Tables" in result.output
+    assert "Issues" in result.output
+
+
+def test_health_show_files_includes_issue_paths(
+    clean_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from librarian.storage.write_models import PreparedChunk
+
+    storage = _storage(clean_db)
+    issue_path = tmp_path / "missing_embedding.md"
+    _write(
+        storage,
+        _prepared_doc(
+            issue_path,
+            document_id="cli-health-show-files",
+            chunks=[
+                PreparedChunk(
+                    chunk_id="cli-health-show-files-c1",
+                    content="chunk without an embedding but with enough content",
+                    chunk_index=0,
+                    start_char=0,
+                    end_char=48,
+                    embedding=None,
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(cli, "SOURCES_FILE", tmp_path / "sources.json")
+    monkeypatch.setattr(cli, "console", Console(width=500, color_system=None))
+
+    result = CliRunner().invoke(cli.app, ["health", "--show-files"])
+
+    assert result.exit_code == 0, result.output
+    assert "missing_embeddings" in result.output
+    assert str(issue_path) in result.output
+
+
+def test_health_source_filter_limits_json_counts(
+    clean_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = _storage(clean_db)
+    docs = tmp_path / "docs"
+    other = tmp_path / "other"
+    docs.mkdir()
+    other.mkdir()
+    _write(storage, _prepared_doc(docs / "a.md", document_id="cli-health-source-a"))
+    _write(storage, _prepared_doc(other / "b.md", document_id="cli-health-source-b"))
+
+    config_dir = tmp_path / "config"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "SOURCES_FILE", config_dir / "sources.json")
+    cli._save_sources([
+        {
+            "name": "docs",
+            "path": str(docs),
+            "type": "local",
+            "is_file": False,
+        }
+    ])
+
+    result = CliRunner().invoke(cli.app, ["health", "--json", "--source", "docs"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["source"] == "docs"
+    assert payload["document_count"] == 1
 
 
 class TestIndexRebuild:

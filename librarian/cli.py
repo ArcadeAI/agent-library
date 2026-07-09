@@ -284,6 +284,103 @@ def _filter_display_sources(
     return [s for s in sources if "tests/data" not in s.get("path", "")]
 
 
+def _format_health_percent(value: float | None) -> str:
+    """Format health coverage values for table output."""
+    if value is None:
+        return "N/A"
+    return f"{value * 100:.1f}%"
+
+
+def _resolve_health_source(source: str | None) -> Any:
+    """Resolve a health source argument using the existing source registry."""
+    if source is None:
+        return None
+
+    from librarian.health import normalize_source_filter, path_source_filter
+
+    registered = _find_source(source)
+    if registered is not None:
+        return normalize_source_filter(registered)
+    return path_source_filter(source)
+
+
+def _health_issue_path(issue: Any) -> str:
+    """Return compact path details for health issue table output."""
+    if issue.path:
+        return str(issue.path)
+    paths = issue.details.get("paths") if isinstance(issue.details, dict) else None
+    if isinstance(paths, list) and paths:
+        shown = [str(path) for path in paths[:3]]
+        if len(paths) > 3:
+            shown.append(f"... and {len(paths) - 3} more")
+        return "\n".join(shown)
+    return ""
+
+
+def _render_health_report(report: Any, *, show_files: bool, limit: int) -> None:
+    """Render a health report with Rich tables."""
+    summary = Table(title="Library Health", show_header=True, header_style="bold cyan")
+    summary.add_column("Metric", style="green")
+    summary.add_column("Value", style="yellow", justify="right")
+    summary.add_row("Documents", str(report.document_count))
+    summary.add_row("Chunks", str(report.chunk_count))
+    summary.add_row("Embeddings", str(report.embedding_count))
+    if report.fts_count is not None:
+        summary.add_row("FTS Rows", str(report.fts_count))
+    summary.add_row("Embedding Coverage", _format_health_percent(report.embedding_coverage))
+    if report.fts_coverage is not None:
+        summary.add_row("FTS Coverage", _format_health_percent(report.fts_coverage))
+    summary.add_row("Backend", str(report.backend))
+    if report.source:
+        summary.add_row("Source", str(report.source))
+    summary.add_row("Database", str(report.database_path))
+    console.print(summary)
+
+    asset_keys = sorted(set(report.document_asset_counts) | set(report.chunk_asset_counts))
+    if asset_keys:
+        asset_table = Table(title="Asset Distribution", show_header=True, header_style="bold cyan")
+        asset_table.add_column("Asset Type", style="green")
+        asset_table.add_column("Documents", style="yellow", justify="right")
+        asset_table.add_column("Chunks", style="yellow", justify="right")
+        for asset_type in asset_keys:
+            asset_table.add_row(
+                asset_type,
+                str(report.document_asset_counts.get(asset_type, 0)),
+                str(report.chunk_asset_counts.get(asset_type, 0)),
+            )
+        console.print(asset_table)
+
+    if report.embedding_counts:
+        embedding_table = Table(
+            title="Embedding Tables", show_header=True, header_style="bold cyan"
+        )
+        embedding_table.add_column("Modality", style="green")
+        embedding_table.add_column("Rows", style="yellow", justify="right")
+        for modality, count in sorted(report.embedding_counts.items()):
+            embedding_table.add_row(modality, str(count))
+        console.print(embedding_table)
+
+    issue_table = Table(title="Issues", show_header=True, header_style="bold cyan")
+    issue_table.add_column("Severity", style="red")
+    issue_table.add_column("Code", style="magenta")
+    issue_table.add_column("Message", style="yellow")
+    if show_files:
+        issue_table.add_column("Paths", style="blue", overflow="fold")
+
+    visible_issues = report.issues[:limit]
+    for issue in visible_issues:
+        row = [issue.severity.value, issue.code.value, issue.message]
+        if show_files:
+            row.append(_health_issue_path(issue))
+        issue_table.add_row(*row)
+
+    if not visible_issues:
+        issue_table.add_row("low", "none", "No health issues detected.")
+    console.print(issue_table)
+    if len(report.issues) > limit:
+        rprint(f"[dim]Showing {limit} of {len(report.issues)} issues. Use --limit to change.[/dim]")
+
+
 def _index_path(file_path: Path, verbose: bool = False) -> dict[str, Any]:
     """Index a single file and return result."""
     from librarian.server import _process_and_index_file
@@ -564,6 +661,46 @@ def _get_timeframe_bounds(timeframe: Timeframe) -> tuple[datetime, datetime]:
         Timeframe.YEAR: TF.THIS_YEAR,
     }
     return get_timeframe_bounds(tf_map[timeframe])
+
+
+# =============================================================================
+# libr health - Read-only diagnostics
+# =============================================================================
+
+
+@app.command("health")
+def health_cmd(
+    show_files: Annotated[
+        bool,
+        typer.Option("--show-files", help="Include file paths and file-level issue details"),
+    ] = False,
+    output_json: Annotated[bool, typer.Option("--json", help="Output as JSON")] = False,
+    source: Annotated[
+        Optional[str],
+        typer.Option("--source", "-s", help="Restrict diagnostics to a source name or path"),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", "-l", help="Max issues in table output")] = 10,
+) -> None:
+    """Scan the current library index for retrieval risk signals."""
+    if limit < 1:
+        raise typer.BadParameter("--limit must be at least 1")
+
+    cfg = _get_config()
+    from librarian.health import scan_library_health
+
+    sources = _load_sources()
+    source_filter = _resolve_health_source(source)
+    report = scan_library_health(
+        database_path=cfg["DATABASE_PATH"],
+        source_filter=source_filter,
+        sources=sources,
+    )
+
+    if output_json:
+        print(json.dumps(report.to_dict(), indent=2, default=str))
+        return
+
+    _render_health_report(report, show_files=show_files, limit=limit)
 
 
 # =============================================================================
