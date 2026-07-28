@@ -7,6 +7,7 @@ for different document formats (Markdown, Obsidian, etc.).
 
 import logging
 import signal
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -40,10 +41,17 @@ def _read_timeout(timeout: int) -> Iterator[None]:
     Windows Python does not expose ``signal.SIGALRM`` / ``signal.alarm``, so we
     fall back to an unbounded read on those platforms rather than refusing to
     parse the file at all.
+
+    The same fallback covers worker threads: ``signal.signal`` raises
+    ``ValueError`` outside the main thread, so a caller indexing from a thread
+    pool (e.g. ``asyncio.to_thread``) would otherwise fail *every* file.
     """
     sigalrm = getattr(signal, "SIGALRM", None)
     alarm = getattr(signal, "alarm", None)
     if sigalrm is None or alarm is None:
+        yield
+        return
+    if threading.current_thread() is not threading.main_thread():
         yield
         return
 

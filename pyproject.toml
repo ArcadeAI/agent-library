@@ -1,6 +1,6 @@
 [project]
 name = "agent-library"
-version = "0.14.1"
+version = "0.14.2"
 description = "Multi-modal knowledge library with vector and full-text search for text, code, images, and PDFs"
 readme = "README.md"
 license = "Apache-2.0"

@@ -43,6 +43,22 @@ class TestSafeReadText:
         content = safe_read_text(test_file)
         assert content == "# Hello\nworld"
 
+    def test_read_from_worker_thread(self, tmp_path: Path) -> None:
+        """Reads must work off the main thread.
+
+        ``signal.signal`` raises ValueError outside the main thread, so callers
+        indexing from a thread pool would otherwise fail on every file.
+        """
+        import concurrent.futures
+
+        test_file = tmp_path / "threaded.md"
+        test_file.write_text("# Threaded\nbody", encoding="utf-8")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            content = pool.submit(safe_read_text, test_file).result()
+
+        assert content == "# Threaded\nbody"
+
     def test_file_not_found(self, tmp_path: Path) -> None:
         """Test FileNotFoundError for missing files."""
         missing = tmp_path / "nonexistent.md"
@@ -125,6 +141,18 @@ class TestSafeReadBytes:
         monkeypatch.delattr(signal, "SIGALRM", raising=False)
 
         content = safe_read_bytes(test_file)
+        assert content == b"\x00\x01\x02"
+
+    def test_read_from_worker_thread(self, tmp_path: Path) -> None:
+        """Binary reads must work off the main thread too."""
+        import concurrent.futures
+
+        test_file = tmp_path / "threaded.bin"
+        test_file.write_bytes(b"\x00\x01\x02")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            content = pool.submit(safe_read_bytes, test_file).result()
+
         assert content == b"\x00\x01\x02"
 
     def test_file_not_found(self, tmp_path: Path) -> None:
