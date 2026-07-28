@@ -118,6 +118,41 @@ class TestSafeReadText:
             safe_read_text(test_file)
 
 
+class TestModelLoadTimeoutHandler:
+    """The embedder's load timeout must not break threaded callers."""
+
+    def test_arms_alarm_on_main_thread(self) -> None:
+        import signal as signal_mod
+
+        from librarian.processing.embed.local import _TimeoutHandler
+
+        original = signal_mod.getsignal(signal_mod.SIGALRM)
+        with _TimeoutHandler(30, "test-model") as handler:
+            assert handler._armed is True
+            assert signal_mod.getsignal(signal_mod.SIGALRM) is not original
+        assert handler._armed is False
+        assert signal_mod.getsignal(signal_mod.SIGALRM) is original
+
+    def test_no_op_on_worker_thread(self) -> None:
+        """``signal.signal`` raises off the main thread; load without a timeout.
+
+        Loading from a thread pool (``asyncio.to_thread``) previously raised
+        ValueError, which surfaced as a total embedding failure.
+        """
+        import concurrent.futures
+
+        from librarian.processing.embed.local import _TimeoutHandler
+
+        def use_handler() -> bool:
+            with _TimeoutHandler(30, "test-model") as handler:
+                return handler._armed
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            armed = pool.submit(use_handler).result()
+
+        assert armed is False
+
+
 class TestSafeReadBytes:
     """Tests for the safe_read_bytes helper."""
 

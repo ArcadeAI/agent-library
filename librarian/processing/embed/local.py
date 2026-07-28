@@ -37,12 +37,19 @@ class ModelLoadTimeoutError(TimeoutError):
 
 
 class _TimeoutHandler:
-    """Context manager for setting a timeout on model loading (Unix only)."""
+    """Context manager for setting a timeout on model loading (Unix only).
+
+    Becomes a no-op when the POSIX alarm is unusable: on platforms without
+    ``SIGALRM``, and on any non-main thread, where ``signal.signal`` raises
+    ``ValueError``. Callers that load the model from a thread pool would
+    otherwise fail outright rather than simply loading without a timeout.
+    """
 
     def __init__(self, seconds: int, model_name: str):
         self.seconds = seconds
         self.model_name = model_name
         self._old_handler: Any = None
+        self._armed = False
 
     def _handler(self, signum: int, frame: Any) -> None:
         raise ModelLoadTimeoutError(
@@ -51,17 +58,26 @@ class _TimeoutHandler:
             f"Try running again or pre-download the model."
         )
 
+    def _can_arm(self) -> bool:
+        return (
+            self.seconds > 0
+            and hasattr(signal, "SIGALRM")
+            and threading.current_thread() is threading.main_thread()
+        )
+
     def __enter__(self) -> "_TimeoutHandler":
-        if self.seconds > 0 and hasattr(signal, "SIGALRM"):
+        if self._can_arm():
             self._old_handler = signal.signal(signal.SIGALRM, self._handler)
             signal.alarm(self.seconds)
+            self._armed = True
         return self
 
     def __exit__(self, *args: Any) -> None:
-        if self.seconds > 0 and hasattr(signal, "SIGALRM"):
+        if self._armed:
             signal.alarm(0)
             if self._old_handler is not None:
                 signal.signal(signal.SIGALRM, self._old_handler)
+            self._armed = False
 
 
 # Suppress sentence-transformers and transformers info/warning messages globally
