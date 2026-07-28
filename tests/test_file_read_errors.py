@@ -4,6 +4,7 @@ Verifies that parsers handle timeout, permission, and I/O errors
 gracefully, especially for cloud-synced filesystems (iCloud, Dropbox).
 """
 
+import signal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -121,6 +122,7 @@ class TestSafeReadText:
 class TestModelLoadTimeoutHandler:
     """The embedder's load timeout must not break threaded callers."""
 
+    @pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="POSIX alarm unavailable (Windows)")
     def test_arms_alarm_on_main_thread(self) -> None:
         import signal as signal_mod
 
