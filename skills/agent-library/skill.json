@@ -1,0 +1,44 @@
+{
+  "$schema": "https://hasna.dev/schemas/skill.v1.json",
+  "standard": "hasna.skill.v1",
+  "name": "agent-library",
+  "description": "Generate an opinionated Agent Library memory policy for coding agents",
+  "version": "0.1.0",
+  "displayName": "Agent Library Memory",
+  "category": "Development Tools",
+  "tags": [
+    "agent-library",
+    "memory",
+    "codex",
+    "claude-code",
+    "cursor",
+    "prompt"
+  ],
+  "inputs": [
+    {
+      "name": "agent",
+      "type": "string",
+      "required": false,
+      "description": "Target agent: codex, claude-code, cursor, or generic."
+    },
+    {
+      "name": "mode",
+      "type": "string",
+      "required": false,
+      "description": "Output mode: full, prompt, or checklist."
+    },
+    {
+      "name": "out",
+      "type": "string",
+      "required": false,
+      "description": "Optional file path for the generated output."
+    }
+  ],
+  "commands": [
+    {
+      "name": "agent-library",
+      "entry": "src/index.ts",
+      "description": "Generate Agent Library memory guidance for coding agents."
+    }
+  ]
+}
