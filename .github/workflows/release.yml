@@ -20,7 +20,7 @@ jobs:
     name: Build Package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -83,7 +83,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
